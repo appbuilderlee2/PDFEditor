@@ -1,0 +1,47 @@
+# Build artifacts
+.build/
+dist/
+*.app/
+*.dmg
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+Packages/
+Packages.checkouts/
+
+# Xcode
+*.framework/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+.DS_Store.*
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Test generated
+__pycache__/
+*.pyc
+Tests/.package/
+
+# macOS archive
+*.xcarchive/

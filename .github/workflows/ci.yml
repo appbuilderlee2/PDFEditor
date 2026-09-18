@@ -1,0 +1,51 @@
+# macOS PDF Editor CI
+
+name: macOS PDF Editor CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    strategy:
+      matrix:
+        build_config: [release, debug]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Select Swift version
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: '5.10'
+
+      - name: Resolve dependencies
+        run: |
+          swift package resolve --skip-self
+
+      - name: Build (release)
+        if: ${{ matrix.build_config == 'release' }}
+        run: |
+          swift build -c release
+
+      - name: Build (debug)
+        if: ${{ matrix.build_config == 'debug' }}
+        run: |
+          swift build -c debug
+
+      - name: Run tests
+        run: |
+          swift test
+
+      - name: Upload artifacts
+        if: ${{ matrix.build_config == 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDFEditor-${{ github.sha }}
+          path: PDFEditor.dmg
+          retention-days: 7
