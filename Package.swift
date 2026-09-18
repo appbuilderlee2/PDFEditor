@@ -19,9 +19,6 @@ let package = Package(
             name: "PDFEditorApp",
             dependencies: [],
             path: "Sources",
-            resources: [
-                .process("Resources")
-            ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
                 .define("DEBUG", .when(configuration: .debug)),

@@ -1,4 +1,4 @@
-# Original macOS PDF Editor
+# PDFEditor — Native macOS PDF Editor
 
 Native macOS PDF Editor (Phase 1). Uses Apple PDFKit + SwiftUI, no copyleft dependencies.
 
@@ -14,8 +14,33 @@ MIT — see LICENSE.md. No AGPL/dual-license dependencies in Phase 1.
 ## Architecture
 ```
 Sources/
-  PDFEngine/  # PDFKit wrapper (abstract protocol)
-  UI/         # Window, sidebar, toolbar, inspector
-  Models/     # Page, DocumentState
-  Utils/      # PDFUtilities, Undo adapter
+  PDFEditorApp.swift     # App entry & DocumentController
+  PDFEngine/
+    PDFEngine.swift      # Abstract protocol
+    PDFKitEngine.swift   # PDFKit implementation
+  UI/
+    MainView.swift       # Main window layout
+    SidebarView.swift    # Page thumbnail sidebar
+    SidebarPageRow.swift # Single page row
+    ToolbarItems.swift   # Toolbar controls
+  Models/
+    Page.swift           # Single page model
+    DocumentState.swift  # Undo/Redo state
+  Utils/
+    DocumentActions.swift # Save/page operations
+    PDFUtils.swift       # Page swap utilities
+    UndoManagerAdapter.swift # NSUndoManager wrapper
 ```
+
+## Build
+```bash
+swift build -c release
+```
+
+## Test
+```bash
+swift test
+```
+
+## CI
+GitHub Actions workflow runs on `macos-15-intel` runner, building both release and debug configurations.

@@ -1,3 +1,5 @@
+# Default gitignore for Swift package on macOS
+
 # Build artifacts
 .build/
 dist/
