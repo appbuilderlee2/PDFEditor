@@ -78,9 +78,7 @@ enum MinimalPDFTextRewriter {
         newText: String
     ) throws {
         guard fileURL.isFileURL else { throw RewriteError.unreadableFile }
-        guard !oldText.isEmpty,
-              oldText.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value <= 0x7E }),
-              newText.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value <= 0x7E }) else {
+        guard !oldText.isEmpty else {
             throw RewriteError.unsupportedEncoding
         }
 
