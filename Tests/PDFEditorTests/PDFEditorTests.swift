@@ -1,3 +1,4 @@
+import Compression
 import PDFKit
 import XCTest
 @testable import PDFEditorApp
@@ -129,7 +130,7 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(raw.contains("(Hello 100) Tj"))
     }
 
-    func testExistingLiteralTextWritebackRejectsLengthChange() throws {
+    func testExistingLiteralTextWritebackSupportsLengthChange() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("PDFEditor-\(UUID().uuidString).pdf")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -140,53 +141,124 @@ final class PDFEditorTests: XCTestCase {
         }
 
         let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
-
-        XCTAssertThrowsError(
-            try PDFContentEngine.shared.replaceText(
-                document: wrapper,
-                pageIndex: 0,
-                oldText: "100",
-                newText: "1200"
-            )
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
         )
 
-        let rawData = try Data(contentsOf: url)
-        let raw = String(data: rawData, encoding: .isoLatin1) ?? ""
-        XCTAssertTrue(raw.contains("(Hello 100) Tj"))
-        XCTAssertFalse(raw.contains("(Hello 1200) Tj"))
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Variable-length rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
-    private func writeMinimalLiteralTextPDF(to url: URL, text: String) throws {
-        let stream = "BT\n/F1 12 Tf\n72 720 Td\n(\(text)) Tj\nET\n"
-        let objects = [
-            "<< /Type /Catalog /Pages 2 0 R >>",
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-            "<< /Length \(stream.utf8.count) >>\nstream\n\(stream)endstream"
-        ]
+    func testCompressedLiteralTextWritebackSupportsLengthChange() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PDFEditor-compressed-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
 
-        var pdf = "%PDF-1.4\n"
-        var offsets: [Int] = [0]
-
-        for (index, object) in objects.enumerated() {
-            offsets.append(pdf.utf8.count)
-            pdf += "\(index + 1) 0 obj\n\(object)\nendobj\n"
+        try writeMinimalLiteralTextPDF(to: url, text: "Hello 100", compressed: true)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Compressed fixture PDF should open in PDFKit")
         }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
 
-        let xrefOffset = pdf.utf8.count
-        pdf += "xref\n0 \(objects.count + 1)\n"
-        pdf += "0000000000 65535 f \n"
-        for offset in offsets.dropFirst() {
-            pdf += String(format: "%010d 00000 n \n", offset)
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Compressed rewritten PDF should reopen")
         }
-        pdf += "trailer\n<< /Size \(objects.count + 1) /Root 1 0 R >>\n"
-        pdf += "startxref\n\(xrefOffset)\n%%EOF\n"
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
 
-        guard let data = pdf.data(using: .ascii) else {
+    private func writeMinimalLiteralTextPDF(
+        to url: URL,
+        text: String,
+        compressed: Bool = false
+    ) throws {
+        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n(\(text)) Tj\nET\n"
+        guard let plainStream = streamText.data(using: .ascii) else {
             throw NSError(domain: "PDFEditorTests", code: 1)
         }
-        try data.write(to: url, options: .atomic)
+        let streamData = compressed ? try zlibEncodeForFixture(plainStream) : plainStream
+
+        var pdf = Data("%PDF-1.4\n".utf8)
+        var offsets: [Int] = [0]
+
+        func appendObject(_ number: Int, header: String, stream: Data? = nil) {
+            offsets.append(pdf.count)
+            pdf.append(contentsOf: "\(number) 0 obj\n".utf8)
+            pdf.append(contentsOf: header.utf8)
+            if let stream {
+                pdf.append(contentsOf: "\nstream\n".utf8)
+                pdf.append(stream)
+                pdf.append(contentsOf: "\nendstream".utf8)
+            }
+            pdf.append(contentsOf: "\nendobj\n".utf8)
+        }
+
+        appendObject(1, header: "<< /Type /Catalog /Pages 2 0 R >>")
+        appendObject(2, header: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        appendObject(
+            3,
+            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        )
+        appendObject(4, header: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+        let filter = compressed ? " /Filter /FlateDecode" : ""
+        appendObject(
+            5,
+            header: "<< /Length \(streamData.count)\(filter) >>",
+            stream: streamData
+        )
+
+        let xrefOffset = pdf.count
+        pdf.append(contentsOf: "xref\n0 6\n".utf8)
+        pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
+        for offset in offsets.dropFirst() {
+            pdf.append(contentsOf: String(format: "%010d 00000 n \n", offset).utf8)
+        }
+        pdf.append(contentsOf: "trailer\n<< /Size 6 /Root 1 0 R >>\n".utf8)
+        pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
+
+        try pdf.write(to: url, options: .atomic)
+    }
+
+    private func zlibEncodeForFixture(_ input: Data) throws -> Data {
+        var capacity = max(input.count * 2, input.count + 1024)
+        while capacity <= 4 * 1024 * 1024 {
+            var output = Data(count: capacity)
+            let encodedCount = output.withUnsafeMutableBytes { destination in
+                input.withUnsafeBytes { source in
+                    compression_encode_buffer(
+                        destination.bindMemory(to: UInt8.self).baseAddress!,
+                        capacity,
+                        source.bindMemory(to: UInt8.self).baseAddress!,
+                        input.count,
+                        nil,
+                        COMPRESSION_ZLIB
+                    )
+                }
+            }
+            if encodedCount > 0 {
+                output.count = encodedCount
+                return output
+            }
+            capacity *= 2
+        }
+        throw NSError(domain: "PDFEditorTests", code: 2)
     }
 
 }
