@@ -66,27 +66,62 @@ enum MinimalPDFTextRewriter {
     private struct ToUnicodeCMap {
         let forward: [Data: String]
         let reverse: [String: Data]
-        let codeLength: Int
+        let codeLengths: [Int]
 
         func decode(_ data: Data) -> String? {
-            guard codeLength > 0, data.count % codeLength == 0 else { return nil }
-            var result = ""
-            var offset = 0
-            while offset < data.count {
-                let chunk = data.subdata(in: offset..<(offset + codeLength))
-                guard let value = forward[chunk] else { return nil }
-                result += value
-                offset += codeLength
+            guard !codeLengths.isEmpty else { return nil }
+            var memo: [Int: String?] = [:]
+
+            func decodeFrom(_ offset: Int) -> String? {
+                if offset == data.count { return "" }
+                if let cached = memo[offset] { return cached }
+
+                for length in codeLengths
+                where length > 0 && offset + length <= data.count {
+                    let chunk = data.subdata(in: offset..<(offset + length))
+                    guard let value = forward[chunk],
+                          let suffix = decodeFrom(offset + length) else {
+                        continue
+                    }
+                    let decoded = value + suffix
+                    memo[offset] = decoded
+                    return decoded
+                }
+
+                memo[offset] = nil
+                return nil
             }
-            return result
+
+            return decodeFrom(0)
         }
 
         func encode(_ string: String) -> Data? {
-            var result = Data()
-            for character in string {
-                guard let code = reverse[String(character)] else { return nil }
-                result.append(code)
+            guard !reverse.isEmpty else { return nil }
+            let unicodeKeys = reverse.keys.sorted {
+                if $0.count != $1.count { return $0.count > $1.count }
+                return $0 > $1
             }
+
+            var result = Data()
+            var index = string.startIndex
+
+            while index < string.endIndex {
+                var matched = false
+
+                for key in unicodeKeys {
+                    guard string[index...].hasPrefix(key),
+                          let code = reverse[key] else {
+                        continue
+                    }
+                    result.append(code)
+                    index = string.index(index, offsetBy: key.count)
+                    matched = true
+                    break
+                }
+
+                guard matched else { return nil }
+            }
+
             return result
         }
     }
@@ -956,10 +991,10 @@ enum MinimalPDFTextRewriter {
         parseBFRangeSections(cmap, into: &forward)
 
         guard !forward.isEmpty else { return nil }
-        let lengths = Set(forward.keys.map(\.count))
-        guard lengths.count == 1, let codeLength = lengths.first, codeLength > 0 else {
-            return nil
-        }
+        let codeLengths = Set(forward.keys.map(\.count))
+            .filter { $0 > 0 }
+            .sorted(by: >)
+        guard !codeLengths.isEmpty else { return nil }
 
         var reverse: [String: Data] = [:]
         for (code, unicode) in forward where reverse[unicode] == nil {
@@ -969,7 +1004,7 @@ enum MinimalPDFTextRewriter {
         return ToUnicodeCMap(
             forward: forward,
             reverse: reverse,
-            codeLength: codeLength
+            codeLengths: codeLengths
         )
     }
 
