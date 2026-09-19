@@ -9,11 +9,12 @@ import Foundation
 /// Supported now:
 /// - literal-string `Tj`
 /// - literal-string `TJ` arrays, including text split across segments
+/// - hex-string `Tj` for byte-oriented Latin/ASCII text
 /// - uncompressed streams
 /// - `/FlateDecode` streams
 /// - variable-length printable-ASCII replacements
 ///
-/// Deliberately not supported yet: hex strings, encrypted PDFs,
+/// Deliberately not supported yet: hex strings inside `TJ` arrays, encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
 enum MinimalPDFTextRewriter {
     enum RewriteError: Error, Equatable {
@@ -250,7 +251,7 @@ enum MinimalPDFTextRewriter {
             throw RewriteError.unsupportedEncoding
         }
 
-        let operatorPattern = #"(\((?:\\.|[^\\)])*\)\s*Tj)|(\[(?:\\.|[^\]])*\]\s*TJ)"#
+        let operatorPattern = #"(\((?:\\.|[^\\)])*\)\s*Tj)|(<[0-9A-Fa-f\s]+>\s*Tj)|(\[(?:\\.|[^\]])*\]\s*TJ)"#
         let regex = try NSRegularExpression(pattern: operatorPattern)
         let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
 
@@ -267,8 +268,17 @@ enum MinimalPDFTextRewriter {
 
             let visibleText: String
             let replacementOperator: String?
+            let trimmed = whole.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            if whole.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("Tj") {
+            if trimmed.hasPrefix("<") && trimmed.hasSuffix("Tj") {
+                guard let parsed = try rewriteHexTjOperator(
+                    whole,
+                    oldText: oldText,
+                    newText: newText
+                ) else { continue }
+                visibleText = parsed.visibleText
+                replacementOperator = parsed.replacement
+            } else if trimmed.hasSuffix("Tj") {
                 guard let parsed = rewriteLiteralTjOperator(
                     whole,
                     oldText: oldText,
@@ -326,6 +336,65 @@ enum MinimalPDFTextRewriter {
         var replaced = decoded
         replaced.replaceSubrange(occurrence, with: newText)
         return (decoded, "(\(encodeLiteralBody(replaced))) Tj")
+    }
+
+    private static func rewriteHexTjOperator(
+        _ whole: String,
+        oldText: String,
+        newText: String
+    ) throws -> (visibleText: String, replacement: String?)? {
+        guard let open = whole.firstIndex(of: "<"),
+              let close = whole.firstIndex(of: ">"),
+              open < close else {
+            return nil
+        }
+
+        let rawHex = String(whole[whole.index(after: open)..<close])
+            .filter { !$0.isWhitespace }
+        guard let decodedData = decodeHexString(rawHex),
+              let decoded = String(data: decodedData, encoding: .isoLatin1) else {
+            throw RewriteError.unsupportedEncoding
+        }
+
+        let occurrences = ranges(of: oldText, in: decoded)
+        guard !occurrences.isEmpty else {
+            return (decoded, nil)
+        }
+        guard occurrences.count == 1, let occurrence = occurrences.first else {
+            throw RewriteError.ambiguousTarget
+        }
+
+        var replaced = decoded
+        replaced.replaceSubrange(occurrence, with: newText)
+
+        guard let bytes = replaced.data(using: .isoLatin1) else {
+            throw RewriteError.unsupportedEncoding
+        }
+
+        return (decoded, "<\(encodeHexString(bytes))> Tj")
+    }
+
+    private static func decodeHexString(_ hex: String) -> Data? {
+        guard !hex.isEmpty else { return Data() }
+        var normalized = hex
+        if normalized.count % 2 != 0 {
+            normalized.append("0")
+        }
+
+        var data = Data()
+        var index = normalized.startIndex
+        while index < normalized.endIndex {
+            let next = normalized.index(index, offsetBy: 2)
+            let pair = normalized[index..<next]
+            guard let byte = UInt8(pair, radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        return data
+    }
+
+    private static func encodeHexString(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined()
     }
 
     private enum TJToken {
