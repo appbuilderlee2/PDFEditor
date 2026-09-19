@@ -277,6 +277,60 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
+    func testHexTjWritebackSupportsLengthChange() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hex-tj-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeHexTjPDF(to: url, compressed: false)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Hex Tj fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Rewritten hex Tj PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
+    func testCompressedHexTjWritebackSupportsLengthChange() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hex-tj-compressed-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeHexTjPDF(to: url, compressed: true)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Compressed hex Tj fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "Hello 100",
+            newText: "Hi 1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Compressed rewritten hex Tj PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hi 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
     func testAmbiguousWritebackFailsWithoutCorruptingPDF() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("PDFEditor-ambiguous-\(UUID().uuidString).pdf")
@@ -304,6 +358,17 @@ final class PDFEditorTests: XCTestCase {
             return XCTFail("Failed writeback must leave a valid PDF")
         }
         XCTAssertTrue(reopened.page(at: 0)?.string?.contains("100 and 100") == true)
+    }
+
+    private func writeHexTjPDF(
+        to url: URL,
+        compressed: Bool
+    ) throws {
+        let hex = Data("Hello 100".utf8)
+            .map { String(format: "%02X", $0) }
+            .joined()
+        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n<\(hex)> Tj\nET\n"
+        try writeCustomContentPDF(to: url, streamText: streamText, compressed: compressed)
     }
 
     private func writeTJArrayPDF(
