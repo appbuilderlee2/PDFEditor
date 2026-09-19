@@ -758,6 +758,46 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
+    func testPageContentsArrayTargetsCorrectStream() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("contents-array-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writePageWithContentsArrayPDF(to: url)
+
+        guard let original = PDFDocument(url: url) else {
+            return XCTFail("Contents-array fixture should open")
+        }
+        let before = original.page(at: 0)?.string ?? ""
+        XCTAssertTrue(before.contains("Hello"))
+        XCTAssertTrue(before.contains("100"))
+
+        let objects = try MinimalPDFTextRewriter.textObjects(in: url)
+        XCTAssertEqual(objects.filter { $0.text == "Hello " }.count, 1)
+        guard let target = objects.first(where: { $0.text == "100" }) else {
+            return XCTFail("Second page content stream should be editable")
+        }
+
+        try MinimalPDFTextRewriter.replaceText(
+            in: url,
+            target: target.id,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Rewritten contents-array PDF should reopen")
+        }
+        let after = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(after.contains("Hello"))
+        XCTAssertTrue(after.contains("1200"))
+        XCTAssertFalse(after.contains("100"))
+
+        let rewritten = try MinimalPDFTextRewriter.textObjects(in: url)
+        XCTAssertEqual(rewritten.filter { $0.text == "Hello " }.count, 1)
+        XCTAssertEqual(rewritten.filter { $0.text == "1200" }.count, 1)
+    }
+
     func testUnreferencedDecoyStreamIsNotTextCandidate() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("unreferenced-decoy-\(UUID().uuidString).pdf")
@@ -1255,6 +1295,73 @@ final class PDFEditorTests: XCTestCase {
         )
 
         let objectCount = 12
+        let xrefOffset = pdf.count
+        pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
+        pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
+        for number in 1...objectCount {
+            pdf.append(
+                contentsOf: String(
+                    format: "%010d 00000 n \n",
+                    offsets[number]
+                ).utf8
+            )
+        }
+        pdf.append(
+            contentsOf: "trailer\n<< /Size \(objectCount + 1) /Root 1 0 R >>\n".utf8
+        )
+        pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
+
+        try pdf.write(to: url, options: .atomic)
+    }
+
+    private func writePageWithContentsArrayPDF(
+        to url: URL
+    ) throws {
+        let firstContent = "BT\n/F1 12 Tf\n72 720 Td\n(Hello ) Tj\nET\n"
+        let secondContent = "BT\n/F1 12 Tf\n108 720 Td\n(100) Tj\nET\n"
+
+        guard let firstData = firstContent.data(using: .ascii),
+              let secondData = secondContent.data(using: .ascii) else {
+            throw NSError(domain: "PDFEditorTests", code: 61)
+        }
+
+        var pdf = Data("%PDF-1.4\n".utf8)
+        var offsets = [Int](repeating: -1, count: 7)
+
+        func appendObject(_ number: Int, header: String, stream: Data? = nil) {
+            offsets[number] = pdf.count
+            pdf.append(contentsOf: "\(number) 0 obj\n".utf8)
+            pdf.append(contentsOf: header.utf8)
+            if let stream {
+                pdf.append(contentsOf: "\nstream\n".utf8)
+                pdf.append(stream)
+                pdf.append(contentsOf: "\nendstream".utf8)
+            }
+            pdf.append(contentsOf: "\nendobj\n".utf8)
+        }
+
+        appendObject(1, header: "<< /Type /Catalog /Pages 2 0 R >>")
+        appendObject(2, header: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        appendObject(
+            3,
+            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents [5 0 R 6 0 R] >>"
+        )
+        appendObject(
+            4,
+            header: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+        )
+        appendObject(
+            5,
+            header: "<< /Length \(firstData.count) >>",
+            stream: firstData
+        )
+        appendObject(
+            6,
+            header: "<< /Length \(secondData.count) >>",
+            stream: secondData
+        )
+
+        let objectCount = 6
         let xrefOffset = pdf.count
         pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
         pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
