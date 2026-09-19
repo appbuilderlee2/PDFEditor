@@ -477,6 +477,64 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
+    func testTargetedTextObjectReplacesOnlySelectedDuplicate() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("targeted-duplicate-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let streamText = """
+        BT
+        /F1 12 Tf
+        72 740 Td
+        (100) Tj
+        0 -20 Td
+        (100) Tj
+        ET
+        """
+        try writeCustomContentPDF(
+            to: url,
+            streamText: streamText,
+            compressed: true
+        )
+
+        guard let original = PDFDocument(url: url) else {
+            return XCTFail("Duplicate-text fixture should open")
+        }
+        XCTAssertTrue((original.page(at: 0)?.string ?? "").contains("100"))
+
+        let beforeObjects = try MinimalPDFTextRewriter.textObjects(in: url)
+            .filter { $0.text == "100" }
+            .sorted {
+                $0.id.operatorStartOffset < $1.id.operatorStartOffset
+            }
+
+        XCTAssertEqual(beforeObjects.count, 2)
+        XCTAssertNotEqual(beforeObjects[0].id, beforeObjects[1].id)
+
+        try MinimalPDFTextRewriter.replaceText(
+            in: url,
+            target: beforeObjects[1].id,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Targeted rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("100"))
+        XCTAssertTrue(extracted.contains("1200"))
+
+        // Enumeration must expose only the latest incremental stream revision,
+        // not both the old and new revisions of the same object.
+        let afterObjects = try MinimalPDFTextRewriter.textObjects(in: url)
+        XCTAssertEqual(afterObjects.filter { $0.text == "100" }.count, 1)
+        XCTAssertEqual(afterObjects.filter { $0.text == "1200" }.count, 1)
+        XCTAssertEqual(afterObjects.filter {
+            $0.text == "100" || $0.text == "1200"
+        }.count, 2)
+    }
+
     func testIndirectLengthCompressedWriteback() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("indirect-length-\(UUID().uuidString).pdf")
