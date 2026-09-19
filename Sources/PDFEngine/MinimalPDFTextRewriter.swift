@@ -14,7 +14,7 @@ import Foundation
 /// - `/FlateDecode` streams
 /// - variable-length printable-ASCII replacements
 /// - direct and indirect stream `/Length` entries
-/// - first-pass Type0 `/Identity-H` hex `Tj` using a single `/ToUnicode` CMap
+/// - Type0 `/Identity-H` hex text using resource-specific `/ToUnicode` CMaps
 ///
 /// Deliberately not supported yet: encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
@@ -96,7 +96,7 @@ enum MinimalPDFTextRewriter {
         }
 
         let streams = try parseStreamObjects(in: originalData)
-        let toUnicodeCMap = try singleType0ToUnicodeCMap(
+        let toUnicodeCMaps = try type0ToUnicodeCMapsByResourceName(
             in: originalData,
             streams: streams
         )
@@ -114,7 +114,7 @@ enum MinimalPDFTextRewriter {
                 in: decoded,
                 oldText: oldText,
                 newText: newText,
-                toUnicodeCMap: toUnicodeCMap
+                toUnicodeCMaps: toUnicodeCMaps
             ) else {
                 continue
             }
@@ -324,49 +324,104 @@ enum MinimalPDFTextRewriter {
 
     // MARK: - Type0 / ToUnicode
 
-    /// First CID milestone: resolve exactly one Type0 font with a ToUnicode
-    /// stream. This is intentionally conservative until page-resource/font
-    /// selection tracking is introduced.
-    private static func singleType0ToUnicodeCMap(
+    /// Resolve Type0 font objects to their ToUnicode streams, then connect
+    /// those font objects to page resource names such as /F1 and /F2.
+    ///
+    /// If the same resource name points to different Type0 fonts in different
+    /// resource dictionaries, that name is treated as ambiguous and omitted.
+    private static func type0ToUnicodeCMapsByResourceName(
         in pdfData: Data,
         streams: [StreamObject]
-    ) throws -> ToUnicodeCMap? {
+    ) throws -> [String: ToUnicodeCMap] {
         guard let source = String(data: pdfData, encoding: .isoLatin1) else {
-            return nil
+            return [:]
         }
 
-        let pattern = #"(?s)\d+\s+\d+\s+obj\s*<<(?:(?!endobj).)*?/Subtype\s*/Type0(?:(?!endobj).)*?/ToUnicode\s+(\d+)\s+(\d+)\s+R(?:(?!endobj).)*?endobj"#
-        let regex = try NSRegularExpression(pattern: pattern)
+        let type0Pattern = #"(?s)(\d+)\s+(\d+)\s+obj\s*<<(?:(?!endobj).)*?/Subtype\s*/Type0(?:(?!endobj).)*?/ToUnicode\s+(\d+)\s+(\d+)\s+R(?:(?!endobj).)*?endobj"#
+        let type0Regex = try NSRegularExpression(pattern: type0Pattern)
         let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
-        let matches = regex.matches(in: source, range: fullRange)
 
-        var references: Set<String> = []
-        var target: (Int, Int)?
+        var cmapByFontObject: [Int: ToUnicodeCMap] = [:]
 
-        for match in matches {
-            guard let objectRange = Range(match.range(at: 1), in: source),
-                  let generationRange = Range(match.range(at: 2), in: source),
-                  let objectNumber = Int(source[objectRange]),
-                  let generation = Int(source[generationRange]) else { continue }
-            references.insert("\(objectNumber):\(generation)")
-            target = (objectNumber, generation)
+        for match in type0Regex.matches(in: source, range: fullRange) {
+            guard let fontObjectRange = Range(match.range(at: 1), in: source),
+                  let cmapObjectRange = Range(match.range(at: 3), in: source),
+                  let cmapGenerationRange = Range(match.range(at: 4), in: source),
+                  let fontObject = Int(source[fontObjectRange]),
+                  let cmapObject = Int(source[cmapObjectRange]),
+                  let cmapGeneration = Int(source[cmapGenerationRange]),
+                  let stream = streams.last(where: {
+                      $0.objectNumber == cmapObject &&
+                      $0.generation == cmapGeneration
+                  }) else {
+                continue
+            }
+
+            let decoded = stream.isFlateEncoded
+                ? try zlibDecode(stream.encodedData)
+                : stream.encodedData
+
+            guard let cmapText = String(data: decoded, encoding: .ascii),
+                  let cmap = parseToUnicodeCMap(cmapText) else {
+                continue
+            }
+            cmapByFontObject[fontObject] = cmap
         }
 
-        guard references.count == 1, let target else { return nil }
-        guard let stream = streams.last(where: {
-            $0.objectNumber == target.0 && $0.generation == target.1
-        }) else {
-            return nil
+        guard !cmapByFontObject.isEmpty else { return [:] }
+
+        let fontDictionaryRegex = try NSRegularExpression(
+            pattern: #"(?s)/Font\s*<<(.+?)>>"#
+        )
+        let entryRegex = try NSRegularExpression(
+            pattern: #"/([^\s/<>\[\]()]+)\s+(\d+)\s+(\d+)\s+R"#
+        )
+
+        var resolved: [String: ToUnicodeCMap] = [:]
+        var resolvedObject: [String: Int] = [:]
+        var ambiguous: Set<String> = []
+
+        for dictMatch in fontDictionaryRegex.matches(in: source, range: fullRange) {
+            guard let dictRange = Range(dictMatch.range(at: 1), in: source) else {
+                continue
+            }
+            let dictionary = String(source[dictRange])
+            let range = NSRange(
+                dictionary.startIndex..<dictionary.endIndex,
+                in: dictionary
+            )
+
+            for entry in entryRegex.matches(in: dictionary, range: range) {
+                guard let nameRange = Range(entry.range(at: 1), in: dictionary),
+                      let objectRange = Range(entry.range(at: 2), in: dictionary),
+                      let objectNumber = Int(dictionary[objectRange]),
+                      let cmap = cmapByFontObject[objectNumber] else {
+                    continue
+                }
+
+                let name = String(dictionary[nameRange])
+                if let previous = resolvedObject[name],
+                   previous != objectNumber {
+                    ambiguous.insert(name)
+                    resolved.removeValue(forKey: name)
+                    resolvedObject.removeValue(forKey: name)
+                    continue
+                }
+
+                guard !ambiguous.contains(name) else { continue }
+                resolved[name] = cmap
+                resolvedObject[name] = objectNumber
+            }
         }
 
-        let decoded = stream.isFlateEncoded
-            ? try zlibDecode(stream.encodedData)
-            : stream.encodedData
-
-        guard let cmapText = String(data: decoded, encoding: .ascii) else {
-            return nil
+        // Some generated PDFs expose a single Type0 font but have unusual
+        // resource formatting. Keep a controlled fallback under a sentinel key.
+        if resolved.isEmpty, cmapByFontObject.count == 1,
+           let only = cmapByFontObject.values.first {
+            resolved["__single_type0_fallback__"] = only
         }
-        return parseToUnicodeCMap(cmapText)
+
+        return resolved
     }
 
     private static func parseToUnicodeCMap(_ cmap: String) -> ToUnicodeCMap? {
@@ -534,7 +589,7 @@ enum MinimalPDFTextRewriter {
         in decodedData: Data,
         oldText: String,
         newText: String,
-        toUnicodeCMap: ToUnicodeCMap?
+        toUnicodeCMaps: [String: ToUnicodeCMap]
     ) throws -> Data? {
         guard var source = String(data: decodedData, encoding: .isoLatin1) else {
             throw RewriteError.unsupportedEncoding
@@ -558,6 +613,13 @@ enum MinimalPDFTextRewriter {
             let visibleText: String
             let replacementOperator: String?
             let trimmed = whole.trimmingCharacters(in: .whitespacesAndNewlines)
+            let currentFont = currentFontResourceName(
+                in: source,
+                before: wholeRange.lowerBound
+            )
+            let toUnicodeCMap =
+                currentFont.flatMap { toUnicodeCMaps[$0] } ??
+                toUnicodeCMaps["__single_type0_fallback__"]
 
             if trimmed.hasPrefix("<") && trimmed.hasSuffix("Tj") {
                 guard let parsed = try rewriteHexTjOperator(
@@ -601,6 +663,25 @@ enum MinimalPDFTextRewriter {
             throw RewriteError.unsupportedEncoding
         }
         return rewritten
+    }
+
+    private static func currentFontResourceName(
+        in source: String,
+        before index: String.Index
+    ) -> String? {
+        let prefix = String(source[..<index])
+        guard let regex = try? NSRegularExpression(
+            pattern: #"/([^\s/<>\[\]()]+)\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s+Tf"#
+        ) else {
+            return nil
+        }
+
+        let range = NSRange(prefix.startIndex..<prefix.endIndex, in: prefix)
+        guard let match = regex.matches(in: prefix, range: range).last,
+              let nameRange = Range(match.range(at: 1), in: prefix) else {
+            return nil
+        }
+        return String(prefix[nameRange])
     }
 
     private static func rewriteLiteralTjOperator(
