@@ -25,8 +25,7 @@ jobs:
           xcodebuild -version
 
       - name: Resolve dependencies
-        run: |
-          swift package resolve --skip-self
+        run: swift package resolve
 
       - name: Build (release)
         if: ${{ matrix.build_config == 'release' }}
