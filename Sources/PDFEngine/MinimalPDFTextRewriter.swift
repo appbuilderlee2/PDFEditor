@@ -372,28 +372,8 @@ enum MinimalPDFTextRewriter {
     private static func parseToUnicodeCMap(_ cmap: String) -> ToUnicodeCMap? {
         var forward: [Data: String] = [:]
 
-        // bfchar: <0001> <4F60>
-        if let regex = try? NSRegularExpression(
-            pattern: #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>"#
-        ) {
-            let range = NSRange(cmap.startIndex..<cmap.endIndex, in: cmap)
-            for match in regex.matches(in: cmap, range: range) {
-                guard let srcRange = Range(match.range(at: 1), in: cmap),
-                      let dstRange = Range(match.range(at: 2), in: cmap),
-                      let src = decodeHexString(String(cmap[srcRange])),
-                      let dstData = decodeHexString(String(cmap[dstRange])),
-                      let unicode = String(data: dstData, encoding: .utf16BigEndian),
-                      !unicode.isEmpty else {
-                    continue
-                }
-
-                // Skip codespace range declarations such as <0000> <FFFF>.
-                if cmapLineContainsCodeSpace(cmap, around: match.range.location) {
-                    continue
-                }
-                forward[src] = unicode
-            }
-        }
+        parseBFCharSections(cmap, into: &forward)
+        parseBFRangeSections(cmap, into: &forward)
 
         guard !forward.isEmpty else { return nil }
         let lengths = Set(forward.keys.map(\.count))
@@ -413,17 +393,137 @@ enum MinimalPDFTextRewriter {
         )
     }
 
-    private static func cmapLineContainsCodeSpace(
+    private static func parseBFCharSections(
         _ cmap: String,
-        around utf16Location: Int
-    ) -> Bool {
-        let ns = cmap as NSString
-        let safe = min(max(utf16Location, 0), ns.length)
-        let prefix = ns.substring(to: safe)
-        guard let lastNewline = prefix.lastIndex(of: "\n") else { return false }
-        let lineStart = prefix.index(after: lastNewline)
-        let linePrefix = String(prefix[lineStart...])
-        return linePrefix.contains("codespacerange")
+        into forward: inout [Data: String]
+    ) {
+        guard let sectionRegex = try? NSRegularExpression(
+            pattern: #"(?s)\d+\s+beginbfchar(.*?)endbfchar"#
+        ),
+        let pairRegex = try? NSRegularExpression(
+            pattern: #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>"#
+        ) else {
+            return
+        }
+
+        let fullRange = NSRange(cmap.startIndex..<cmap.endIndex, in: cmap)
+        for sectionMatch in sectionRegex.matches(in: cmap, range: fullRange) {
+            guard let sectionRange = Range(sectionMatch.range(at: 1), in: cmap) else {
+                continue
+            }
+            let section = String(cmap[sectionRange])
+            let range = NSRange(section.startIndex..<section.endIndex, in: section)
+
+            for match in pairRegex.matches(in: section, range: range) {
+                guard let srcRange = Range(match.range(at: 1), in: section),
+                      let dstRange = Range(match.range(at: 2), in: section),
+                      let src = decodeHexString(String(section[srcRange])),
+                      let dstData = decodeHexString(String(section[dstRange])),
+                      let unicode = String(data: dstData, encoding: .utf16BigEndian),
+                      !unicode.isEmpty else {
+                    continue
+                }
+                forward[src] = unicode
+            }
+        }
+    }
+
+    private static func parseBFRangeSections(
+        _ cmap: String,
+        into forward: inout [Data: String]
+    ) {
+        guard let sectionRegex = try? NSRegularExpression(
+            pattern: #"(?s)\d+\s+beginbfrange(.*?)endbfrange"#
+        ),
+        let rangeRegex = try? NSRegularExpression(
+            pattern: #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>"#
+        ) else {
+            return
+        }
+
+        let fullRange = NSRange(cmap.startIndex..<cmap.endIndex, in: cmap)
+        for sectionMatch in sectionRegex.matches(in: cmap, range: fullRange) {
+            guard let sectionRange = Range(sectionMatch.range(at: 1), in: cmap) else {
+                continue
+            }
+            let section = String(cmap[sectionRange])
+            let range = NSRange(section.startIndex..<section.endIndex, in: section)
+
+            for match in rangeRegex.matches(in: section, range: range) {
+                guard let startRange = Range(match.range(at: 1), in: section),
+                      let endRange = Range(match.range(at: 2), in: section),
+                      let dstRange = Range(match.range(at: 3), in: section),
+                      let sourceStart = decodeHexString(String(section[startRange])),
+                      let sourceEnd = decodeHexString(String(section[endRange])),
+                      let destinationStart = decodeHexString(String(section[dstRange])),
+                      sourceStart.count == sourceEnd.count,
+                      let startValue = integerValue(sourceStart),
+                      let endValue = integerValue(sourceEnd),
+                      endValue >= startValue else {
+                    continue
+                }
+
+                let count = endValue - startValue
+                // Avoid pathological CMaps from exploding memory in this MVP.
+                guard count <= 65_535 else { continue }
+
+                for delta in 0...count {
+                    guard let sourceCode = dataValue(
+                        startValue + delta,
+                        byteCount: sourceStart.count
+                    ),
+                    let destination = incrementUTF16BE(
+                        destinationStart,
+                        by: delta
+                    ),
+                    let unicode = String(
+                        data: destination,
+                        encoding: .utf16BigEndian
+                    ),
+                    !unicode.isEmpty else {
+                        continue
+                    }
+                    forward[sourceCode] = unicode
+                }
+            }
+        }
+    }
+
+    private static func integerValue(_ data: Data) -> UInt64? {
+        guard data.count <= 8 else { return nil }
+        var value: UInt64 = 0
+        for byte in data {
+            value = (value << 8) | UInt64(byte)
+        }
+        return value
+    }
+
+    private static func dataValue(_ value: UInt64, byteCount: Int) -> Data? {
+        guard byteCount > 0, byteCount <= 8 else { return nil }
+        let maxValue: UInt64 = byteCount == 8
+            ? UInt64.max
+            : (UInt64(1) << UInt64(byteCount * 8)) - 1
+        guard value <= maxValue else { return nil }
+
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        var working = value
+        for index in stride(from: byteCount - 1, through: 0, by: -1) {
+            bytes[index] = UInt8(working & 0xFF)
+            working >>= 8
+        }
+        return Data(bytes)
+    }
+
+    private static func incrementUTF16BE(
+        _ data: Data,
+        by delta: UInt64
+    ) -> Data? {
+        guard data.count == 2 || data.count == 4,
+              let value = integerValue(data),
+              value <= UInt64.max - delta else {
+            return nil
+        }
+        return dataValue(value + delta, byteCount: data.count)
     }
 
     // MARK: - Tj / TJ replacement
