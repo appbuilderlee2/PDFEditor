@@ -783,15 +783,42 @@ final class PDFEditorTests: XCTestCase {
     }
 
     private func writeMixedLengthToUnicodePDF(to url: URL) throws {
+        // Legal Type0 custom Encoding CMap:
         // 1-byte source codes are in 0x20...0x7F; 2-byte source codes are in
-        // 0x81xx, so the codespaces are unambiguous.
+        // 0x81xx. The Encoding CMap maps character codes to CIDs, while the
+        // separate ToUnicode CMap maps the same character codes to Unicode.
         let content = "BT\n/F1 16 Tf\n72 720 Td\n<418102313030> Tj\nET\n"
         guard let contentPlain = content.data(using: .ascii) else {
             throw NSError(domain: "PDFEditorTests", code: 50)
         }
         let contentData = try zlibEncodeForFixture(contentPlain)
 
-        let cmap = """
+        let encodingCMap = """
+        /CIDInit /ProcSet findresource begin
+        12 dict begin
+        begincmap
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def
+        /CMapName /MixedLength-Encoding def
+        /CMapType 1 def
+        2 begincodespacerange
+        <20> <7F>
+        <8100> <81FF>
+        endcodespacerange
+        6 begincidchar
+        <41> 1
+        <42> 2
+        <8102> 3
+        <30> 16
+        <31> 17
+        <32> 18
+        endcidchar
+        endcmap
+        CMapName currentdict /CMap defineresource pop
+        end
+        end
+        """
+
+        let toUnicodeCMap = """
         /CIDInit /ProcSet findresource begin
         12 dict begin
         begincmap
@@ -815,13 +842,16 @@ final class PDFEditorTests: XCTestCase {
         end
         end
         """
-        guard let cmapPlain = cmap.data(using: .ascii) else {
+
+        guard let encodingPlain = encodingCMap.data(using: .ascii),
+              let toUnicodePlain = toUnicodeCMap.data(using: .ascii) else {
             throw NSError(domain: "PDFEditorTests", code: 51)
         }
-        let cmapData = try zlibEncodeForFixture(cmapPlain)
+        let encodingData = try zlibEncodeForFixture(encodingPlain)
+        let toUnicodeData = try zlibEncodeForFixture(toUnicodePlain)
 
         var pdf = Data("%PDF-1.4\n".utf8)
-        var offsets = [Int](repeating: -1, count: 9)
+        var offsets = [Int](repeating: -1, count: 11)
 
         func appendObject(_ number: Int, header: String, stream: Data? = nil) {
             offsets[number] = pdf.count
@@ -839,11 +869,11 @@ final class PDFEditorTests: XCTestCase {
         appendObject(2, header: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
         appendObject(
             3,
-            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 8 0 R >>"
+            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 10 0 R >>"
         )
         appendObject(
             4,
-            header: "<< /Type /Font /Subtype /Type0 /BaseFont /MixedLengthCID /Encoding /Identity-H /DescendantFonts [5 0 R] /ToUnicode 7 0 R >>"
+            header: "<< /Type /Font /Subtype /Type0 /BaseFont /MixedLengthCID /Encoding 7 0 R /DescendantFonts [5 0 R] /ToUnicode 8 0 R >>"
         )
         appendObject(
             5,
@@ -855,16 +885,24 @@ final class PDFEditorTests: XCTestCase {
         )
         appendObject(
             7,
-            header: "<< /Length \(cmapData.count) /Filter /FlateDecode >>",
-            stream: cmapData
+            header: "<< /Length \(encodingData.count) /Filter /FlateDecode >>",
+            stream: encodingData
         )
         appendObject(
             8,
+            header: "<< /Length \(toUnicodeData.count) /Filter /FlateDecode >>",
+            stream: toUnicodeData
+        )
+        // Keep an unused object number to exercise non-contiguous references
+        // without changing the content-stream object used by the test.
+        appendObject(9, header: "<< >>")
+        appendObject(
+            10,
             header: "<< /Length \(contentData.count) /Filter /FlateDecode >>",
             stream: contentData
         )
 
-        let objectCount = 8
+        let objectCount = 10
         let xrefOffset = pdf.count
         pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
         pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
