@@ -1,38 +1,20 @@
 import Foundation
-import PDFKit
 
-// MARK: - Page Model
+struct DocumentState: Equatable {
+    var pages: [PDFPageModel] = []
+    var currentPageIndex = 0
 
-struct Page {
-    let index: Int
-    let title: String
-    let rotation: Int
-}
-
-// MARK: - Document State
-
-class DocumentState: ObservableObject {
-    @Published var pages: [Page] = []
-    @Published var currentPageIndex: Int = 0
-    
-    // Undo/Redo support
-    private var undoStack: [() -> Void] = []
-    private var redoStack: [() -> Void] = []
-    
-    func addUndoAction(_ action: @escaping () -> Void) {
-        undoStack.append(action)
-        redoStack.removeAll()
+    mutating func replacePages(with newPages: [PDFPageModel]) {
+        pages = newPages
+        currentPageIndex = Self.clampedPageIndex(currentPageIndex, pageCount: newPages.count)
     }
-    
-    func undo() {
-        guard !undoStack.isEmpty else { return }
-        let action = undoStack.removeLast()
-        action()
+
+    mutating func selectPage(at index: Int) {
+        currentPageIndex = Self.clampedPageIndex(index, pageCount: pages.count)
     }
-    
-    func redo() {
-        guard !redoStack.isEmpty else { return }
-        let action = redoStack.removeLast()
-        action()
+
+    private static func clampedPageIndex(_ index: Int, pageCount: Int) -> Int {
+        guard pageCount > 0 else { return 0 }
+        return min(max(index, 0), pageCount - 1)
     }
 }

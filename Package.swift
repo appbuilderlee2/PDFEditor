@@ -27,8 +27,7 @@ let package = Package(
         .testTarget(
             name: "PDFEditorTests",
             dependencies: ["PDFEditorApp"],
-            path: "Tests/PDFEditorTests",
-            resources: []
+            path: "Tests/PDFEditorTests"
         ),
     ]
 )

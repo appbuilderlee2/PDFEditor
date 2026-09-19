@@ -9,17 +9,14 @@ on:
     branches: [main, master]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: macos-15-intel
-    strategy:
-      matrix:
-        build_config: [release, debug]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Select Swift version
+      - name: Print toolchain versions
         run: |
           swift --version
           xcodebuild -version
@@ -27,26 +24,23 @@ jobs:
       - name: Resolve dependencies
         run: swift package resolve
 
-      - name: Build (release)
-        if: ${{ matrix.build_config == 'release' }}
-        run: |
-          swift build -c release
-
       - name: Build (debug)
-        if: ${{ matrix.build_config == 'debug' }}
-        run: |
-          swift build -c debug
+        run: swift build -c debug
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Locate release executable
+        id: release-bin
+        run: echo "path=$(swift build -c release --show-bin-path)" >> "$GITHUB_OUTPUT"
 
       - name: Run tests
-        run: |
-          swift test
+        run: swift test
 
-      - name: Upload artifacts
-        if: ${{ matrix.build_config == 'release' }}
+      - name: Upload release executable
         uses: actions/upload-artifact@v4
         with:
           name: PDFEditor-${{ github.sha }}
-          path: |
-            .build/release/PDFEditor
-            .build/debug/PDFEditor
+          path: ${{ steps.release-bin.outputs.path }}/PDFEditor
+          if-no-files-found: error
           retention-days: 7

@@ -1,92 +1,83 @@
-import SwiftUI
 import PDFKit
+import SwiftUI
 
+@MainActor
 struct SidebarPageRow: View {
     let document: PDFDocumentWrapper
-    let pageIndex: Int
+    let page: PDFPageModel
     let isSelected: Bool
-    @Binding var pdfView: PDFView?
-    var onSelect: () -> Void
-    var onDelete: () -> Void
-    var onRotate: () -> Void
-    var onDuplicate: () -> Void
+    let canMoveUp: Bool
+    let canMoveDown: Bool
+    let onSelect: () -> Void
+    let onDelete: () -> Void
+    let onRotate: () -> Void
+    let onDuplicate: () -> Void
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            // 縮圖
-            if let page = document.pdfDocument?.page(at: pageIndex) {
-                let thumb = page.thumbnail(of: CGSize(width: 100, height: 120), for: .mediaBox)
-                Image(nsImage: thumb)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 80, height: 96)
-                    .cornerRadius(6)
-            } else {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.gray.opacity(0.2))
-                    .frame(width: 80, height: 96)
-            }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                thumbnail
 
-            // 頁面資訊
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("頁 \(pageIndex + 1)")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(page.title)
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.primary)
+                        .lineLimit(1)
 
-                    if document.rotation != 0 {
-                        Image(systemName: ".rotate.90")
-                            .font(.system(size: 10))
-                            .foregroundColor(.blue)
+                    Text("Page \(page.index + 1)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if page.rotation != 0 {
+                        Label("\(page.rotation)°", systemImage: "rotate.right")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
                     }
                 }
 
-                if let page = document.pdfDocument?.page(at: pageIndex) {
-                    let text = page.string?.prefix(30) ?? ""
-                    Text(String(text) + (page.string?.count ?? 0 > 30 ? "..." : ""))
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
+                Spacer(minLength: 0)
             }
 
-            Spacer()
-
-            // 動作按鈕
-            HStack(spacing: 4) {
-                Button(action: onSelect) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10))
-                        .foregroundColor(.blue)
-                }
-                .buttonStyle(PlainButtonStyle())
-
-                Button(action: onDelete) {
+            HStack(spacing: 10) {
+                Button(action: onMoveUp) { Image(systemName: "arrow.up") }
+                    .disabled(!canMoveUp)
+                    .help("Move Page Up")
+                Button(action: onMoveDown) { Image(systemName: "arrow.down") }
+                    .disabled(!canMoveDown)
+                    .help("Move Page Down")
+                Button(action: onRotate) { Image(systemName: "rotate.right") }
+                    .help("Rotate Page")
+                Button(action: onDuplicate) { Image(systemName: "doc.on.doc") }
+                    .help("Duplicate Page")
+                Button(role: .destructive, action: onDelete) {
                     Image(systemName: "trash")
-                        .font(.system(size: 10))
-                        .foregroundColor(.red)
                 }
-                .buttonStyle(PlainButtonStyle())
-
-                Button(action: onRotate) {
-                    Image(systemName: ".rotate.3d")
-                        .font(.system(size: 10))
-                        .foregroundColor(.orange)
-                }
-                .buttonStyle(PlainButtonStyle())
-
-                Button(action: onDuplicate) {
-                    Image(systemName: "doc.on.doc")
-                        .font(.system(size: 10))
-                        .foregroundColor(.green)
-                }
-                .buttonStyle(PlainButtonStyle())
+                .help("Delete Page")
             }
+            .buttonStyle(.borderless)
         }
         .padding(8)
-        .background(isSelected ? Color.blue.opacity(0.1) : Color.clear)
-        .cornerRadius(8)
+        .background(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
-        .onTapGesture { onSelect() }
+        .onTapGesture(perform: onSelect)
+    }
+
+    @ViewBuilder
+    private var thumbnail: some View {
+        if let pdfPage = document.pdfDocument?.page(at: page.index) {
+            Image(nsImage: pdfPage.thumbnail(of: CGSize(width: 96, height: 120), for: .cropBox))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 72, height: 90)
+                .background(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .shadow(color: .black.opacity(0.15), radius: 2, y: 1)
+        } else {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(.quaternary)
+                .frame(width: 72, height: 90)
+        }
     }
 }

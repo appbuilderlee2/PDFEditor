@@ -1,22 +1,24 @@
-// MARK: - Page Model（支援內容編輯狀態）
+import CoreGraphics
+import Foundation
 
-public struct Page {
-    let index: Int
-    let title: String
-    let rotation: Int
-}
+// MARK: - Annotation Model
 
-// MARK: - Annotation Model（支持高亮、註記、自由手繪）
-
-public struct AnnotationModel {
+public struct AnnotationModel: Identifiable, Sendable {
     public let id: UUID
     public let type: AnnotationType
     public let rect: CGRect
     public var text: String
-    public var color: String // HEX
+    public var color: String
     public var createdAt: Date
 
-    public init(id: UUID = UUID(), type: AnnotationType, rect: CGRect, text: String, color: String = "#FFFF00", createdAt: Date = Date()) {
+    public init(
+        id: UUID = UUID(),
+        type: AnnotationType,
+        rect: CGRect,
+        text: String,
+        color: String = "#FFFF00",
+        createdAt: Date = Date()
+    ) {
         self.id = id
         self.type = type
         self.rect = rect
@@ -26,7 +28,7 @@ public struct AnnotationModel {
     }
 }
 
-public enum AnnotationType {
+public enum AnnotationType: Sendable {
     case highlight
     case underline
     case strikeThrough
