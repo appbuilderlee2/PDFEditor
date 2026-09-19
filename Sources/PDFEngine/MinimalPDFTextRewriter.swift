@@ -1,22 +1,43 @@
+import Compression
 import Foundation
 
-/// Conservative first write-back backend for existing PDF text.
+/// Conservative content-stream writer for the first existing-text editing
+/// milestones. It performs real PDF incremental updates: the original bytes
+/// remain intact and a newer revision of the target stream object is appended
+/// with a fresh xref/trailer section.
 ///
-/// This implementation intentionally supports only a narrow, verifiable case:
-/// an uncompressed literal-string `Tj` operator whose replacement keeps the
-/// same encoded byte length. Keeping the byte length stable means the original
-/// stream `/Length`, xref offsets, and trailer remain valid.
+/// Supported now:
+/// - literal-string `Tj`
+/// - uncompressed streams
+/// - `/FlateDecode` streams
+/// - variable-length printable-ASCII replacements
 ///
-/// It performs a real content-stream byte replacement. It does not add an
-/// annotation, draw an overlay, or cover the original text.
+/// Deliberately not supported yet: `TJ` arrays, hex strings, encrypted PDFs,
+/// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
 enum MinimalPDFTextRewriter {
     enum RewriteError: Error, Equatable {
         case unsupportedEncoding
-        case replacementChangesEncodedLength
+        case unsupportedPDF
+        case unsupportedFilter
+        case decompressionFailed
+        case compressionFailed
         case targetNotFound
         case ambiguousTarget
         case unreadableFile
         case writeFailed
+    }
+
+    private struct StreamObject {
+        let objectNumber: Int
+        let generation: Int
+        let dictionary: String
+        let encodedData: Data
+        let isFlateEncoded: Bool
+    }
+
+    private struct Candidate {
+        let stream: StreamObject
+        let rewrittenDecodedData: Data
     }
 
     static func replaceUniqueLiteralText(
@@ -25,77 +46,435 @@ enum MinimalPDFTextRewriter {
         newText: String
     ) throws {
         guard fileURL.isFileURL else { throw RewriteError.unreadableFile }
-        guard oldText.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value <= 0x7E }),
+        guard !oldText.isEmpty,
+              oldText.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value <= 0x7E }),
               newText.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value <= 0x7E }) else {
             throw RewriteError.unsupportedEncoding
         }
 
-        guard let data = try? Data(contentsOf: fileURL),
-              let source = String(data: data, encoding: .isoLatin1) else {
+        guard let originalData = try? Data(contentsOf: fileURL),
+              !originalData.isEmpty else {
             throw RewriteError.unreadableFile
         }
 
-        // Match PDF literal strings immediately consumed by a Tj operator.
-        // This handles escaped characters inside the literal, but deliberately
-        // does not claim support for hex strings or TJ arrays yet.
-        let pattern = #"\((?:\\.|[^\\)])*\)\s*Tj"#
-        let regex = try NSRegularExpression(pattern: pattern)
-        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        let headerText = String(decoding: originalData.prefix(min(originalData.count, 4096)), as: UTF8.self)
+        guard headerText.contains("%PDF-") else { throw RewriteError.unsupportedPDF }
 
-        struct Candidate {
-            let bodyRange: Range<String.Index>
-            let replacementBody: String
+        let latin1 = String(data: originalData, encoding: .isoLatin1) ?? ""
+        if latin1.contains("/Encrypt") {
+            throw RewriteError.unsupportedPDF
         }
 
+        let streams = try parseStreamObjects(in: originalData)
         var candidates: [Candidate] = []
 
-        for match in regex.matches(in: source, range: fullRange) {
-            guard let wholeRange = Range(match.range, in: source),
-                  let open = source[wholeRange].firstIndex(of: "(") else { continue }
+        for stream in streams {
+            let decoded: Data
+            if stream.isFlateEncoded {
+                decoded = try zlibDecode(stream.encodedData)
+            } else {
+                decoded = stream.encodedData
+            }
 
-            let operatorSlice = source[wholeRange]
-            guard let closeRelative = operatorSlice.lastIndex(of: ")") else { continue }
-            let close = closeRelative
-
-            let bodyStart = source.index(after: open)
-            let bodyRange = bodyStart..<close
-            let encodedBody = String(source[bodyRange])
-            let decodedBody = decodeLiteralBody(encodedBody)
-
-            guard let occurrence = decodedBody.range(of: oldText) else { continue }
-            guard decodedBody[occurrence.upperBound...].range(of: oldText) == nil else {
-                // Multiple occurrences in a single Tj object are ambiguous for
-                // this first milestone.
+            guard let rewritten = try rewriteUniqueLiteralTj(
+                in: decoded,
+                oldText: oldText,
+                newText: newText
+            ) else {
                 continue
             }
 
-            var replaced = decodedBody
-            replaced.replaceSubrange(occurrence, with: newText)
-            let replacementBody = encodeLiteralBody(replaced)
-
-            guard replacementBody.utf8.count == encodedBody.utf8.count else {
-                throw RewriteError.replacementChangesEncodedLength
-            }
-
-            candidates.append(Candidate(bodyRange: bodyRange, replacementBody: replacementBody))
+            candidates.append(Candidate(stream: stream, rewrittenDecodedData: rewritten))
         }
 
         guard !candidates.isEmpty else { throw RewriteError.targetNotFound }
         guard candidates.count == 1 else { throw RewriteError.ambiguousTarget }
 
         let candidate = candidates[0]
-        var rewritten = source
-        rewritten.replaceSubrange(candidate.bodyRange, with: candidate.replacementBody)
+        let newEncodedData = candidate.stream.isFlateEncoded
+            ? try zlibEncode(candidate.rewrittenDecodedData)
+            : candidate.rewrittenDecodedData
 
-        guard let output = rewritten.data(using: .isoLatin1) else {
-            throw RewriteError.unsupportedEncoding
-        }
+        let previousXref = try lastStartXref(in: originalData)
+        let trailer = try trailerInfo(in: originalData)
+        let rewrittenDictionary = replacingLength(
+            in: candidate.stream.dictionary,
+            with: newEncodedData.count
+        )
+
+        let updatedData = makeIncrementalRevision(
+            originalData: originalData,
+            objectNumber: candidate.stream.objectNumber,
+            generation: candidate.stream.generation,
+            dictionary: rewrittenDictionary,
+            streamData: newEncodedData,
+            previousXref: previousXref,
+            trailerSize: max(trailer.size, candidate.stream.objectNumber + 1),
+            rootObjectNumber: trailer.rootObjectNumber,
+            rootGeneration: trailer.rootGeneration
+        )
 
         do {
-            try output.write(to: fileURL, options: .atomic)
+            try updatedData.write(to: fileURL, options: .atomic)
         } catch {
             throw RewriteError.writeFailed
         }
+    }
+
+    // MARK: - Stream parsing
+
+    private static func parseStreamObjects(in data: Data) throws -> [StreamObject] {
+        let bytes = [UInt8](data)
+        let marker = Array(" obj".utf8)
+        let streamMarker = Array("stream".utf8)
+        let endStreamMarker = Array("endstream".utf8)
+        var results: [StreamObject] = []
+        var searchIndex = 0
+
+        while let objMarker = find(marker, in: bytes, from: searchIndex) {
+            guard let lineStart = previousLineStart(in: bytes, before: objMarker),
+                  let header = asciiString(bytes[lineStart..<objMarker]),
+                  let (objectNumber, generation) = parseObjectHeader(header) else {
+                searchIndex = objMarker + marker.count
+                continue
+            }
+
+            let afterHeader = objMarker + marker.count
+            guard let streamPos = find(streamMarker, in: bytes, from: afterHeader),
+                  let endObjPos = find(Array("endobj".utf8), in: bytes, from: afterHeader),
+                  streamPos < endObjPos else {
+                searchIndex = afterHeader
+                continue
+            }
+
+            let dictionaryBytes = bytes[afterHeader..<streamPos]
+            guard let dictionary = String(bytes: dictionaryBytes, encoding: .isoLatin1),
+                  dictionary.contains("<<"),
+                  dictionary.contains(">>"),
+                  dictionary.contains("/Length") else {
+                searchIndex = afterHeader
+                continue
+            }
+
+            if dictionary.contains("/Filter"),
+               !dictionary.contains("/FlateDecode") {
+                searchIndex = afterHeader
+                continue
+            }
+
+            var streamDataStart = streamPos + streamMarker.count
+            if streamDataStart < bytes.count, bytes[streamDataStart] == 0x0D {
+                streamDataStart += 1
+                if streamDataStart < bytes.count, bytes[streamDataStart] == 0x0A {
+                    streamDataStart += 1
+                }
+            } else if streamDataStart < bytes.count, bytes[streamDataStart] == 0x0A {
+                streamDataStart += 1
+            }
+
+            guard let endStreamPos = find(endStreamMarker, in: bytes, from: streamDataStart),
+                  endStreamPos <= endObjPos else {
+                searchIndex = afterHeader
+                continue
+            }
+
+            var streamDataEnd = endStreamPos
+            if streamDataEnd > streamDataStart, bytes[streamDataEnd - 1] == 0x0A {
+                streamDataEnd -= 1
+                if streamDataEnd > streamDataStart, bytes[streamDataEnd - 1] == 0x0D {
+                    streamDataEnd -= 1
+                }
+            } else if streamDataEnd > streamDataStart, bytes[streamDataEnd - 1] == 0x0D {
+                streamDataEnd -= 1
+            }
+
+            results.append(
+                StreamObject(
+                    objectNumber: objectNumber,
+                    generation: generation,
+                    dictionary: dictionary.trimmingCharacters(in: .whitespacesAndNewlines),
+                    encodedData: Data(bytes[streamDataStart..<streamDataEnd]),
+                    isFlateEncoded: dictionary.contains("/FlateDecode")
+                )
+            )
+
+            searchIndex = endObjPos + 6
+        }
+
+        return results
+    }
+
+    private static func parseObjectHeader(_ text: String) -> (Int, Int)? {
+        let pieces = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: { $0.isWhitespace })
+        guard pieces.count >= 2,
+              let objectNumber = Int(pieces[pieces.count - 2]),
+              let generation = Int(pieces[pieces.count - 1]) else {
+            return nil
+        }
+        return (objectNumber, generation)
+    }
+
+    // MARK: - Literal Tj replacement
+
+    /// Returns nil if this decoded content stream does not contain the target.
+    /// Throws ambiguousTarget if the target appears more than once in this
+    /// stream, because object identity is not implemented yet.
+    private static func rewriteUniqueLiteralTj(
+        in decodedData: Data,
+        oldText: String,
+        newText: String
+    ) throws -> Data? {
+        guard var source = String(data: decodedData, encoding: .isoLatin1) else {
+            throw RewriteError.unsupportedEncoding
+        }
+
+        let pattern = #"\((?:\\.|[^\\)])*\)\s*Tj"#
+        let regex = try NSRegularExpression(pattern: pattern)
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+
+        struct Match {
+            let bodyRange: Range<String.Index>
+            let replacementBody: String
+        }
+
+        var matches: [Match] = []
+
+        for result in regex.matches(in: source, range: fullRange) {
+            guard let wholeRange = Range(result.range, in: source),
+                  let open = source[wholeRange].firstIndex(of: "("),
+                  let close = source[wholeRange].lastIndex(of: ")") else {
+                continue
+            }
+
+            let bodyRange = source.index(after: open)..<close
+            let encodedBody = String(source[bodyRange])
+            let decodedBody = decodeLiteralBody(encodedBody)
+
+            var searchStart = decodedBody.startIndex
+            var occurrenceCount = 0
+            var onlyOccurrence: Range<String.Index>?
+
+            while searchStart <= decodedBody.endIndex,
+                  let occurrence = decodedBody.range(of: oldText, range: searchStart..<decodedBody.endIndex) {
+                occurrenceCount += 1
+                onlyOccurrence = occurrence
+                searchStart = occurrence.upperBound
+            }
+
+            guard occurrenceCount > 0 else { continue }
+            guard occurrenceCount == 1, let occurrence = onlyOccurrence else {
+                throw RewriteError.ambiguousTarget
+            }
+
+            var replaced = decodedBody
+            replaced.replaceSubrange(occurrence, with: newText)
+            matches.append(
+                Match(
+                    bodyRange: bodyRange,
+                    replacementBody: encodeLiteralBody(replaced)
+                )
+            )
+        }
+
+        guard !matches.isEmpty else { return nil }
+        guard matches.count == 1 else { throw RewriteError.ambiguousTarget }
+
+        let match = matches[0]
+        source.replaceSubrange(match.bodyRange, with: match.replacementBody)
+
+        guard let rewritten = source.data(using: .isoLatin1) else {
+            throw RewriteError.unsupportedEncoding
+        }
+        return rewritten
+    }
+
+    // MARK: - Incremental PDF update
+
+    private static func makeIncrementalRevision(
+        originalData: Data,
+        objectNumber: Int,
+        generation: Int,
+        dictionary: String,
+        streamData: Data,
+        previousXref: Int,
+        trailerSize: Int,
+        rootObjectNumber: Int,
+        rootGeneration: Int
+    ) -> Data {
+        var output = originalData
+        if output.last != 0x0A { output.append(0x0A) }
+
+        let objectOffset = output.count
+        appendASCII("\(objectNumber) \(generation) obj\n", to: &output)
+        appendASCII(dictionary, to: &output)
+        appendASCII("\nstream\n", to: &output)
+        output.append(streamData)
+        appendASCII("\nendstream\nendobj\n", to: &output)
+
+        let xrefOffset = output.count
+        appendASCII("xref\n\(objectNumber) 1\n", to: &output)
+        appendASCII(String(format: "%010d %05d n \n", objectOffset, generation), to: &output)
+        appendASCII(
+            "trailer\n<< /Size \(trailerSize) /Root \(rootObjectNumber) \(rootGeneration) R /Prev \(previousXref) >>\n",
+            to: &output
+        )
+        appendASCII("startxref\n\(xrefOffset)\n%%EOF\n", to: &output)
+        return output
+    }
+
+    private static func replacingLength(in dictionary: String, with length: Int) -> String {
+        let pattern = #"/Length\s+\d+"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           regex.firstMatch(
+               in: dictionary,
+               range: NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
+           ) != nil {
+            return regex.stringByReplacingMatches(
+                in: dictionary,
+                range: NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary),
+                withTemplate: "/Length \(length)"
+            )
+        }
+
+        guard let close = dictionary.range(of: ">>", options: .backwards) else {
+            return dictionary
+        }
+        var value = dictionary
+        value.insert(contentsOf: " /Length \(length) ", at: close.lowerBound)
+        return value
+    }
+
+    private static func lastStartXref(in data: Data) throws -> Int {
+        guard let text = String(data: data, encoding: .isoLatin1) else {
+            throw RewriteError.unsupportedPDF
+        }
+        let pattern = #"startxref\s+(\d+)"#
+        let regex = try NSRegularExpression(pattern: pattern)
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.matches(in: text, range: range).last,
+              let valueRange = Range(match.range(at: 1), in: text),
+              let value = Int(text[valueRange]) else {
+            throw RewriteError.unsupportedPDF
+        }
+        return value
+    }
+
+    private static func trailerInfo(
+        in data: Data
+    ) throws -> (size: Int, rootObjectNumber: Int, rootGeneration: Int) {
+        guard let text = String(data: data, encoding: .isoLatin1) else {
+            throw RewriteError.unsupportedPDF
+        }
+
+        let rootRegex = try NSRegularExpression(pattern: #"/Root\s+(\d+)\s+(\d+)\s+R"#)
+        let sizeRegex = try NSRegularExpression(pattern: #"/Size\s+(\d+)"#)
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+
+        guard let rootMatch = rootRegex.matches(in: text, range: fullRange).last,
+              let rootNumberRange = Range(rootMatch.range(at: 1), in: text),
+              let rootGenerationRange = Range(rootMatch.range(at: 2), in: text),
+              let rootObjectNumber = Int(text[rootNumberRange]),
+              let rootGeneration = Int(text[rootGenerationRange]),
+              let sizeMatch = sizeRegex.matches(in: text, range: fullRange).last,
+              let sizeRange = Range(sizeMatch.range(at: 1), in: text),
+              let size = Int(text[sizeRange]) else {
+            throw RewriteError.unsupportedPDF
+        }
+
+        return (size, rootObjectNumber, rootGeneration)
+    }
+
+    // MARK: - FlateDecode
+
+    private static func zlibDecode(_ input: Data) throws -> Data {
+        guard !input.isEmpty else { return Data() }
+        var capacity = max(input.count * 4, 4096)
+
+        while capacity <= 64 * 1024 * 1024 {
+            var output = Data(count: capacity)
+            let decodedCount = output.withUnsafeMutableBytes { destination in
+                input.withUnsafeBytes { source in
+                    compression_decode_buffer(
+                        destination.bindMemory(to: UInt8.self).baseAddress!,
+                        capacity,
+                        source.bindMemory(to: UInt8.self).baseAddress!,
+                        input.count,
+                        nil,
+                        COMPRESSION_ZLIB
+                    )
+                }
+            }
+
+            if decodedCount > 0 {
+                output.count = decodedCount
+                return output
+            }
+            capacity *= 2
+        }
+
+        throw RewriteError.decompressionFailed
+    }
+
+    private static func zlibEncode(_ input: Data) throws -> Data {
+        guard !input.isEmpty else { return Data() }
+        var capacity = max(input.count + 1024, input.count * 2)
+
+        while capacity <= 64 * 1024 * 1024 {
+            var output = Data(count: capacity)
+            let encodedCount = output.withUnsafeMutableBytes { destination in
+                input.withUnsafeBytes { source in
+                    compression_encode_buffer(
+                        destination.bindMemory(to: UInt8.self).baseAddress!,
+                        capacity,
+                        source.bindMemory(to: UInt8.self).baseAddress!,
+                        input.count,
+                        nil,
+                        COMPRESSION_ZLIB
+                    )
+                }
+            }
+
+            if encodedCount > 0 {
+                output.count = encodedCount
+                return output
+            }
+            capacity *= 2
+        }
+
+        throw RewriteError.compressionFailed
+    }
+
+    // MARK: - Helpers
+
+    private static func appendASCII(_ string: String, to data: inout Data) {
+        data.append(contentsOf: string.utf8)
+    }
+
+    private static func asciiString(_ bytes: ArraySlice<UInt8>) -> String? {
+        String(bytes: bytes, encoding: .ascii)
+    }
+
+    private static func previousLineStart(in bytes: [UInt8], before index: Int) -> Int? {
+        var cursor = index
+        while cursor > 0 {
+            let byte = bytes[cursor - 1]
+            if byte == 0x0A || byte == 0x0D { break }
+            cursor -= 1
+        }
+        return cursor
+    }
+
+    private static func find(_ needle: [UInt8], in haystack: [UInt8], from start: Int) -> Int? {
+        guard !needle.isEmpty, start <= haystack.count - needle.count else { return nil }
+        var index = max(0, start)
+        while index <= haystack.count - needle.count {
+            if haystack[index..<(index + needle.count)].elementsEqual(needle) {
+                return index
+            }
+            index += 1
+        }
+        return nil
     }
 
     private static func decodeLiteralBody(_ body: String) -> String {
@@ -125,7 +504,6 @@ enum MinimalPDFTextRewriter {
             case "(", ")", "\\":
                 result.append(body[next])
             default:
-                // Preserve unknown escapes conservatively.
                 result.append(body[next])
             }
 
