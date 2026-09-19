@@ -515,8 +515,8 @@ final class PDFEditorTests: XCTestCase {
         useTJArray: Bool = false
     ) throws {
         let textOperator = useTJArray
-            ? "[<0001> -25 <0002> 10 <001000120012>] TJ"
-            : "<00010002001000120012> Tj"
+            ? "[<0001> -25 <0002> 10 <001100100010>] TJ"
+            : "<00010002001100100010> Tj"
         let content = "BT\n/F1 16 Tf\n72 720 Td\n\(textOperator)\nET\n"
         guard let contentPlain = content.data(using: .ascii) else {
             throw NSError(domain: "PDFEditorTests", code: 10)
@@ -533,14 +533,14 @@ final class PDFEditorTests: XCTestCase {
         1 begincodespacerange
         <0000> <FFFF>
         endcodespacerange
-        6 beginbfchar
+        3 beginbfchar
         <0001> <4F60>
         <0002> <597D>
         <0003> <60A8>
-        <0010> <0031>
-        <0011> <0032>
-        <0012> <0030>
         endbfchar
+        1 beginbfrange
+        <0010> <0012> <0030>
+        endbfrange
         endcmap
         CMapName currentdict /CMap defineresource pop
         end
