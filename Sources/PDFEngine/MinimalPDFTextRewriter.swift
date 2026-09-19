@@ -410,17 +410,33 @@ enum MinimalPDFTextRewriter {
 
     private static func zlibDecode(_ input: Data) throws -> Data {
         guard !input.isEmpty else { return Data() }
-        var capacity = max(input.count * 4, 4096)
+
+        // Apple's Compression framework names this algorithm ZLIB, but its
+        // buffer API consumes raw RFC1951 DEFLATE. PDF /FlateDecode streams are
+        // RFC1950 zlib streams, so strip the wrapper before decoding.
+        let rawDeflate: Data
+        let expectedAdler: UInt32?
+
+        if let wrapped = splitZlibStream(input) {
+            rawDeflate = wrapped.payload
+            expectedAdler = wrapped.adler32
+        } else {
+            // Be permissive with non-conforming PDFs that contain raw DEFLATE.
+            rawDeflate = input
+            expectedAdler = nil
+        }
+
+        var capacity = max(rawDeflate.count * 4, 4096)
 
         while capacity <= 64 * 1024 * 1024 {
             var output = Data(count: capacity)
             let decodedCount = output.withUnsafeMutableBytes { destination in
-                input.withUnsafeBytes { source in
+                rawDeflate.withUnsafeBytes { source in
                     compression_decode_buffer(
                         destination.bindMemory(to: UInt8.self).baseAddress!,
                         capacity,
                         source.bindMemory(to: UInt8.self).baseAddress!,
-                        input.count,
+                        rawDeflate.count,
                         nil,
                         COMPRESSION_ZLIB
                     )
@@ -429,6 +445,9 @@ enum MinimalPDFTextRewriter {
 
             if decodedCount > 0 {
                 output.count = decodedCount
+                if let expectedAdler, adler32(output) != expectedAdler {
+                    throw RewriteError.decompressionFailed
+                }
                 return output
             }
             capacity *= 2
@@ -442,8 +461,8 @@ enum MinimalPDFTextRewriter {
         var capacity = max(input.count + 1024, input.count * 2)
 
         while capacity <= 64 * 1024 * 1024 {
-            var output = Data(count: capacity)
-            let encodedCount = output.withUnsafeMutableBytes { destination in
+            var raw = Data(count: capacity)
+            let encodedCount = raw.withUnsafeMutableBytes { destination in
                 input.withUnsafeBytes { source in
                     compression_encode_buffer(
                         destination.bindMemory(to: UInt8.self).baseAddress!,
@@ -457,13 +476,63 @@ enum MinimalPDFTextRewriter {
             }
 
             if encodedCount > 0 {
-                output.count = encodedCount
-                return output
+                raw.count = encodedCount
+
+                // RFC1950 zlib wrapper. 0x78 0x9C declares DEFLATE with a 32K
+                // window and a default compression level. FLEVEL is advisory.
+                var wrapped = Data([0x78, 0x9C])
+                wrapped.append(raw)
+                let checksum = adler32(input)
+                wrapped.append(UInt8((checksum >> 24) & 0xFF))
+                wrapped.append(UInt8((checksum >> 16) & 0xFF))
+                wrapped.append(UInt8((checksum >> 8) & 0xFF))
+                wrapped.append(UInt8(checksum & 0xFF))
+                return wrapped
             }
             capacity *= 2
         }
 
         throw RewriteError.compressionFailed
+    }
+
+    private static func splitZlibStream(
+        _ input: Data
+    ) -> (payload: Data, adler32: UInt32)? {
+        guard input.count >= 6 else { return nil }
+        let bytes = [UInt8](input)
+        let cmf = bytes[0]
+        let flg = bytes[1]
+
+        guard cmf & 0x0F == 8,
+              ((Int(cmf) << 8) + Int(flg)) % 31 == 0,
+              flg & 0x20 == 0 else {
+            return nil
+        }
+
+        let checksumStart = bytes.count - 4
+        let checksum =
+            (UInt32(bytes[checksumStart]) << 24) |
+            (UInt32(bytes[checksumStart + 1]) << 16) |
+            (UInt32(bytes[checksumStart + 2]) << 8) |
+            UInt32(bytes[checksumStart + 3])
+
+        return (
+            Data(bytes[2..<checksumStart]),
+            checksum
+        )
+    }
+
+    private static func adler32(_ data: Data) -> UInt32 {
+        let modulus: UInt32 = 65_521
+        var a: UInt32 = 1
+        var b: UInt32 = 0
+
+        for byte in data {
+            a = (a + UInt32(byte)) % modulus
+            b = (b + a) % modulus
+        }
+
+        return (b << 16) | a
     }
 
     // MARK: - Helpers
