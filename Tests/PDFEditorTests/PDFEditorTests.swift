@@ -221,6 +221,62 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
+    func testTJArrayWritebackAcrossLiteralSegments() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tj-array-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeTJArrayPDF(to: url, compressed: false)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("TJ fixture should open")
+        }
+
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Rewritten TJ PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
+    func testCompressedTJArrayWritebackAcrossLiteralSegments() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tj-array-compressed-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeTJArrayPDF(to: url, compressed: true)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Compressed TJ fixture should open")
+        }
+
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Compressed rewritten TJ PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
     func testAmbiguousWritebackFailsWithoutCorruptingPDF() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("PDFEditor-ambiguous-\(UUID().uuidString).pdf")
@@ -250,14 +306,21 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertTrue(reopened.page(at: 0)?.string?.contains("100 and 100") == true)
     }
 
-    private func writeMinimalLiteralTextPDF(
+    private func writeTJArrayPDF(
         to url: URL,
-        text: String,
-        compressed: Bool = false
+        compressed: Bool
     ) throws {
-        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n(\(text)) Tj\nET\n"
+        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n[(Hello ) -20 (100)] TJ\nET\n"
+        try writeCustomContentPDF(to: url, streamText: streamText, compressed: compressed)
+    }
+
+    private func writeCustomContentPDF(
+        to url: URL,
+        streamText: String,
+        compressed: Bool
+    ) throws {
         guard let plainStream = streamText.data(using: .ascii) else {
-            throw NSError(domain: "PDFEditorTests", code: 1)
+            throw NSError(domain: "PDFEditorTests", code: 3)
         }
         let streamData = compressed ? try zlibEncodeForFixture(plainStream) : plainStream
 
@@ -301,6 +364,15 @@ final class PDFEditorTests: XCTestCase {
         pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
 
         try pdf.write(to: url, options: .atomic)
+    }
+
+    private func writeMinimalLiteralTextPDF(
+        to url: URL,
+        text: String,
+        compressed: Bool = false
+    ) throws {
+        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n(\(text)) Tj\nET\n"
+        try writeCustomContentPDF(to: url, streamText: streamText, compressed: compressed)
     }
 
     private func zlibEncodeForFixture(_ input: Data) throws -> Data {
