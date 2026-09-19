@@ -648,18 +648,6 @@ final class PDFEditorTests: XCTestCase {
         }
         let contentData = try zlibEncodeForFixture(contentPlain)
 
-        let numericRange = useBFRangeArray
-            ? """
-              1 beginbfrange
-              <0010> <0012> [<0030> <0031> <0032>]
-              endbfrange
-              """
-            : """
-              1 beginbfrange
-              <0010> <0012> <0030>
-              endbfrange
-              """
-
         let cmap = """
         /CIDInit /ProcSet findresource begin
         12 dict begin
@@ -675,7 +663,9 @@ final class PDFEditorTests: XCTestCase {
         <0002> <597D>
         <0003> <60A8>
         endbfchar
-        \(numericRange)
+        1 beginbfrange
+        <0010> <0012> <0030>
+        endbfrange
         endcmap
         CMapName currentdict /CMap defineresource pop
         end
@@ -759,6 +749,18 @@ final class PDFEditorTests: XCTestCase {
         }
         let contentData = compressed ? try zlibEncodeForFixture(contentPlain) : contentPlain
 
+        let numericRange = useBFRangeArray
+            ? """
+              1 beginbfrange
+              <0010> <0012> [<0030> <0031> <0032>]
+              endbfrange
+              """
+            : """
+              1 beginbfrange
+              <0010> <0012> <0030>
+              endbfrange
+              """
+
         let cmap = """
         /CIDInit /ProcSet findresource begin
         12 dict begin
@@ -774,9 +776,7 @@ final class PDFEditorTests: XCTestCase {
         <0002> <597D>
         <0003> <60A8>
         endbfchar
-        1 beginbfrange
-        <0010> <0012> <0030>
-        endbfrange
+        \(numericRange)
         endcmap
         CMapName currentdict /CMap defineresource pop
         end
