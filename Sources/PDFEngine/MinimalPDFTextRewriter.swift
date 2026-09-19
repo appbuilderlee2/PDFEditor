@@ -120,6 +120,10 @@ enum MinimalPDFTextRewriter {
             in: originalData,
             streams: streams
         )
+        let toUnicodeCMapsByContentStream = try type0ToUnicodeCMapsByContentStream(
+            in: originalData,
+            streams: streams
+        )
         var candidates: [Candidate] = []
 
         for stream in latestStreamObjects(streams) {
@@ -134,7 +138,9 @@ enum MinimalPDFTextRewriter {
                 in: decoded,
                 oldText: oldText,
                 newText: newText,
-                toUnicodeCMaps: toUnicodeCMaps
+                toUnicodeCMaps:
+                    toUnicodeCMapsByContentStream[streamKey(stream)] ??
+                    toUnicodeCMaps
             ) else {
                 continue
             }
@@ -177,9 +183,10 @@ enum MinimalPDFTextRewriter {
                     in: source,
                     before: wholeRange.lowerBound
                 )
+                let activeMaps = cMaps(for: stream, context: context)
                 let cmap =
-                    fontResourceName.flatMap { context.toUnicodeCMaps[$0] } ??
-                    context.toUnicodeCMaps["__single_type0_fallback__"]
+                    fontResourceName.flatMap { activeMaps[$0] } ??
+                    activeMaps["__single_type0_fallback__"]
 
                 guard let parsed = try parseVisibleTextOperator(
                     whole,
@@ -244,9 +251,10 @@ enum MinimalPDFTextRewriter {
             in: source,
             before: wholeRange.lowerBound
         )
+        let activeMaps = cMaps(for: stream, context: context)
         let cmap =
-            fontResourceName.flatMap { context.toUnicodeCMaps[$0] } ??
-            context.toUnicodeCMaps["__single_type0_fallback__"]
+            fontResourceName.flatMap { activeMaps[$0] } ??
+            activeMaps["__single_type0_fallback__"]
 
         guard let replacement = try rewriteSpecificTextOperator(
             whole,
@@ -274,6 +282,7 @@ enum MinimalPDFTextRewriter {
         let originalData: Data
         let streams: [StreamObject]
         let toUnicodeCMaps: [String: ToUnicodeCMap]
+        let toUnicodeCMapsByContentStream: [String: [String: ToUnicodeCMap]]
     }
 
     private static func loadContext(from fileURL: URL) throws -> RewriteContext {
@@ -301,10 +310,15 @@ enum MinimalPDFTextRewriter {
             in: originalData,
             streams: streams
         )
+        let streamMaps = try type0ToUnicodeCMapsByContentStream(
+            in: originalData,
+            streams: streams
+        )
         return RewriteContext(
             originalData: originalData,
             streams: streams,
-            toUnicodeCMaps: maps
+            toUnicodeCMaps: maps,
+            toUnicodeCMapsByContentStream: streamMaps
         )
     }
 
@@ -318,6 +332,28 @@ enum MinimalPDFTextRewriter {
             let key = "\(stream.objectNumber):\(stream.generation)"
             return latestIndex[key] == index ? stream : nil
         }
+    }
+
+    private static func streamKey(
+        objectNumber: Int,
+        generation: Int
+    ) -> String {
+        "\(objectNumber):\(generation)"
+    }
+
+    private static func streamKey(_ stream: StreamObject) -> String {
+        streamKey(
+            objectNumber: stream.objectNumber,
+            generation: stream.generation
+        )
+    }
+
+    private static func cMaps(
+        for stream: StreamObject,
+        context: RewriteContext
+    ) -> [String: ToUnicodeCMap] {
+        context.toUnicodeCMapsByContentStream[streamKey(stream)] ??
+        context.toUnicodeCMaps
     }
 
     // MARK: - Stream parsing
