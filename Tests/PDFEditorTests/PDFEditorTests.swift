@@ -163,7 +163,7 @@ final class PDFEditorTests: XCTestCase {
 
     func testCompressedLiteralTextWritebackSupportsLengthChange() throws {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("PDFEditor-compressed-\(UUID().uuidString).pdf")
+            .appendingPathComponent("compressed-literal-tj-\(UUID().uuidString).pdf")
         defer { try? FileManager.default.removeItem(at: url) }
 
         try writeMinimalLiteralTextPDF(to: url, text: "Hello 100", compressed: true)
@@ -185,6 +185,39 @@ final class PDFEditorTests: XCTestCase {
         }
         let extracted = reopened.page(at: 0)?.string ?? ""
         XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
+    func testCompressedIncrementalWritebackCanBeAppliedTwice() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("compressed-literal-tj-twice-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeMinimalLiteralTextPDF(to: url, text: "Hello 100", compressed: true)
+        guard let original = PDFDocument(url: url) else {
+            return XCTFail("Compressed fixture should open")
+        }
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: original)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "1200",
+            newText: "13000"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Twice-updated PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 13000"))
+        XCTAssertFalse(extracted.contains("Hello 1200"))
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
