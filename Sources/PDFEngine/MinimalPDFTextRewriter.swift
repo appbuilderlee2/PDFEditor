@@ -969,11 +969,24 @@ enum MinimalPDFTextRewriter {
             }
             let section = String(cmap[sectionRange])
             let sectionNSRange = NSRange(section.startIndex..<section.endIndex, in: section)
+            let arrayMatches = arrayRegex.matches(
+                in: section,
+                range: sectionNSRange
+            )
+            let arrayRanges = arrayMatches.map(\.range)
 
             // Sequential form:
             // <0001> <0003> <4F60>
             // maps each successive source code to successive UTF-16BE values.
+            //
+            // Important: destination arrays contain runs such as
+            // <0030> <0031> <0032>. Those must not themselves be mistaken for
+            // a sequential bfrange entry.
             for match in sequentialRegex.matches(in: section, range: sectionNSRange) {
+                let overlapsArray = arrayRanges.contains {
+                    NSIntersectionRange($0, match.range).length > 0
+                }
+                if overlapsArray { continue }
                 guard let startRange = Range(match.range(at: 1), in: section),
                       let endRange = Range(match.range(at: 2), in: section),
                       let dstRange = Range(match.range(at: 3), in: section),
@@ -1014,7 +1027,7 @@ enum MinimalPDFTextRewriter {
             // <0001> <0003> [<4F60> <597D> <60A8>]
             // maps each source code to the corresponding explicit Unicode
             // destination. This is common in generated/subset-font PDFs.
-            for match in arrayRegex.matches(in: section, range: sectionNSRange) {
+            for match in arrayMatches {
                 guard let startRange = Range(match.range(at: 1), in: section),
                       let endRange = Range(match.range(at: 2), in: section),
                       let arrayBodyRange = Range(match.range(at: 3), in: section),
