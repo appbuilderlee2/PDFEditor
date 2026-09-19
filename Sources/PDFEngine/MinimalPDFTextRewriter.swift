@@ -14,6 +14,7 @@ import Foundation
 /// - `/FlateDecode` streams
 /// - variable-length printable-ASCII replacements
 /// - direct and indirect stream `/Length` entries
+/// - first-pass Type0 `/Identity-H` hex `Tj` using a single `/ToUnicode` CMap
 ///
 /// Deliberately not supported yet: encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
@@ -42,6 +43,34 @@ enum MinimalPDFTextRewriter {
         let stream: StreamObject
         let rewrittenDecodedData: Data
     }
+    private struct ToUnicodeCMap {
+        let forward: [Data: String]
+        let reverse: [String: Data]
+        let codeLength: Int
+
+        func decode(_ data: Data) -> String? {
+            guard codeLength > 0, data.count % codeLength == 0 else { return nil }
+            var result = ""
+            var offset = 0
+            while offset < data.count {
+                let chunk = data.subdata(in: offset..<(offset + codeLength))
+                guard let value = forward[chunk] else { return nil }
+                result += value
+                offset += codeLength
+            }
+            return result
+        }
+
+        func encode(_ string: String) -> Data? {
+            var result = Data()
+            for character in string {
+                guard let code = reverse[String(character)] else { return nil }
+                result.append(code)
+            }
+            return result
+        }
+    }
+
 
     static func replaceUniqueLiteralText(
         in fileURL: URL,
@@ -69,6 +98,10 @@ enum MinimalPDFTextRewriter {
         }
 
         let streams = try parseStreamObjects(in: originalData)
+        let toUnicodeCMap = try singleType0ToUnicodeCMap(
+            in: originalData,
+            streams: streams
+        )
         var candidates: [Candidate] = []
 
         for stream in streams {
@@ -82,7 +115,8 @@ enum MinimalPDFTextRewriter {
             guard let rewritten = try rewriteUniqueTextOperator(
                 in: decoded,
                 oldText: oldText,
-                newText: newText
+                newText: newText,
+                toUnicodeCMap: toUnicodeCMap
             ) else {
                 continue
             }
@@ -290,6 +324,110 @@ enum MinimalPDFTextRewriter {
         return (objectNumber, generation)
     }
 
+    // MARK: - Type0 / ToUnicode
+
+    /// First CID milestone: resolve exactly one Type0 font with a ToUnicode
+    /// stream. This is intentionally conservative until page-resource/font
+    /// selection tracking is introduced.
+    private static func singleType0ToUnicodeCMap(
+        in pdfData: Data,
+        streams: [StreamObject]
+    ) throws -> ToUnicodeCMap? {
+        guard let source = String(data: pdfData, encoding: .isoLatin1) else {
+            return nil
+        }
+
+        let pattern = #"(?s)\d+\s+\d+\s+obj\s*<<(?:(?!endobj).)*?/Subtype\s*/Type0(?:(?!endobj).)*?/ToUnicode\s+(\d+)\s+(\d+)\s+R(?:(?!endobj).)*?endobj"#
+        let regex = try NSRegularExpression(pattern: pattern)
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        let matches = regex.matches(in: source, range: fullRange)
+
+        var references: Set<String> = []
+        var target: (Int, Int)?
+
+        for match in matches {
+            guard let objectRange = Range(match.range(at: 1), in: source),
+                  let generationRange = Range(match.range(at: 2), in: source),
+                  let objectNumber = Int(source[objectRange]),
+                  let generation = Int(source[generationRange]) else { continue }
+            references.insert("\(objectNumber):\(generation)")
+            target = (objectNumber, generation)
+        }
+
+        guard references.count == 1, let target else { return nil }
+        guard let stream = streams.last(where: {
+            $0.objectNumber == target.0 && $0.generation == target.1
+        }) else {
+            return nil
+        }
+
+        let decoded = stream.isFlateEncoded
+            ? try zlibDecode(stream.encodedData)
+            : stream.encodedData
+
+        guard let cmapText = String(data: decoded, encoding: .ascii) else {
+            return nil
+        }
+        return parseToUnicodeCMap(cmapText)
+    }
+
+    private static func parseToUnicodeCMap(_ cmap: String) -> ToUnicodeCMap? {
+        var forward: [Data: String] = [:]
+
+        // bfchar: <0001> <4F60>
+        if let regex = try? NSRegularExpression(
+            pattern: #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>"#
+        ) {
+            let range = NSRange(cmap.startIndex..<cmap.endIndex, in: cmap)
+            for match in regex.matches(in: cmap, range: range) {
+                guard let srcRange = Range(match.range(at: 1), in: cmap),
+                      let dstRange = Range(match.range(at: 2), in: cmap),
+                      let src = decodeHexString(String(cmap[srcRange])),
+                      let dstData = decodeHexString(String(cmap[dstRange])),
+                      let unicode = String(data: dstData, encoding: .utf16BigEndian),
+                      !unicode.isEmpty else {
+                    continue
+                }
+
+                // Skip codespace range declarations such as <0000> <FFFF>.
+                if cmapLineContainsCodeSpace(cmap, around: match.range.location) {
+                    continue
+                }
+                forward[src] = unicode
+            }
+        }
+
+        guard !forward.isEmpty else { return nil }
+        let lengths = Set(forward.keys.map(\.count))
+        guard lengths.count == 1, let codeLength = lengths.first, codeLength > 0 else {
+            return nil
+        }
+
+        var reverse: [String: Data] = [:]
+        for (code, unicode) in forward where reverse[unicode] == nil {
+            reverse[unicode] = code
+        }
+
+        return ToUnicodeCMap(
+            forward: forward,
+            reverse: reverse,
+            codeLength: codeLength
+        )
+    }
+
+    private static func cmapLineContainsCodeSpace(
+        _ cmap: String,
+        around utf16Location: Int
+    ) -> Bool {
+        let ns = cmap as NSString
+        let safe = min(max(utf16Location, 0), ns.length)
+        let prefix = ns.substring(to: safe)
+        guard let lastNewline = prefix.lastIndex(of: "\n") else { return false }
+        let lineStart = prefix.index(after: lastNewline)
+        let linePrefix = String(prefix[lineStart...])
+        return linePrefix.contains("codespacerange")
+    }
+
     // MARK: - Tj / TJ replacement
 
     /// Rewrites exactly one matching text-show operator in the decoded stream.
@@ -297,7 +435,8 @@ enum MinimalPDFTextRewriter {
     private static func rewriteUniqueTextOperator(
         in decodedData: Data,
         oldText: String,
-        newText: String
+        newText: String,
+        toUnicodeCMap: ToUnicodeCMap?
     ) throws -> Data? {
         guard var source = String(data: decodedData, encoding: .isoLatin1) else {
             throw RewriteError.unsupportedEncoding
@@ -326,7 +465,8 @@ enum MinimalPDFTextRewriter {
                 guard let parsed = try rewriteHexTjOperator(
                     whole,
                     oldText: oldText,
-                    newText: newText
+                    newText: newText,
+                    toUnicodeCMap: toUnicodeCMap
                 ) else { continue }
                 visibleText = parsed.visibleText
                 replacementOperator = parsed.replacement
@@ -393,7 +533,8 @@ enum MinimalPDFTextRewriter {
     private static func rewriteHexTjOperator(
         _ whole: String,
         oldText: String,
-        newText: String
+        newText: String,
+        toUnicodeCMap: ToUnicodeCMap?
     ) throws -> (visibleText: String, replacement: String?)? {
         guard let open = whole.firstIndex(of: "<"),
               let close = whole.firstIndex(of: ">"),
@@ -403,9 +544,25 @@ enum MinimalPDFTextRewriter {
 
         let rawHex = String(whole[whole.index(after: open)..<close])
             .filter { !$0.isWhitespace }
-        guard let decodedData = decodeHexString(rawHex),
-              let decoded = String(data: decodedData, encoding: .isoLatin1) else {
+        guard let decodedData = decodeHexString(rawHex) else {
             throw RewriteError.unsupportedEncoding
+        }
+
+        let decoded: String
+        if let toUnicodeCMap {
+            guard let mapped = toUnicodeCMap.decode(decodedData) else {
+                // This hex operator may belong to a simple byte font even when
+                // another Type0 font exists in the document; fall back below.
+                guard let latin = String(data: decodedData, encoding: .isoLatin1) else {
+                    throw RewriteError.unsupportedEncoding
+                }
+                decoded = latin
+            }
+        } else {
+            guard let latin = String(data: decodedData, encoding: .isoLatin1) else {
+                throw RewriteError.unsupportedEncoding
+            }
+            decoded = latin
         }
 
         let occurrences = ranges(of: oldText, in: decoded)
@@ -419,8 +576,18 @@ enum MinimalPDFTextRewriter {
         var replaced = decoded
         replaced.replaceSubrange(occurrence, with: newText)
 
-        guard let bytes = replaced.data(using: .isoLatin1) else {
-            throw RewriteError.unsupportedEncoding
+        let bytes: Data
+        if let toUnicodeCMap,
+           toUnicodeCMap.decode(decodedData) != nil {
+            guard let mapped = toUnicodeCMap.encode(replaced) else {
+                throw RewriteError.unsupportedEncoding
+            }
+            bytes = mapped
+        } else {
+            guard let latin = replaced.data(using: .isoLatin1) else {
+                throw RewriteError.unsupportedEncoding
+            }
+            bytes = latin
         }
 
         return (decoded, "<\(encodeHexString(bytes))> Tj")
