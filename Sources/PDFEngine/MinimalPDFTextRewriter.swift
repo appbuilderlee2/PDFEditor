@@ -682,6 +682,9 @@ enum MinimalPDFTextRewriter {
         let indirectResourcesRegex = try NSRegularExpression(
             pattern: #"/Resources\s+(\d+)\s+(\d+)\s+R"#
         )
+        let indirectFontDictionaryRegex = try NSRegularExpression(
+            pattern: #"/Font\s+(\d+)\s+(\d+)\s+R"#
+        )
         let contentsArrayRegex = try NSRegularExpression(
             pattern: #"(?s)/Contents\s*\[(.*?)\]"#
         )
@@ -705,38 +708,63 @@ enum MinimalPDFTextRewriter {
         }
 
         func fontObjects(in resourceText: String) -> [String: Int] {
+            func parseEntries(_ dictionary: String) -> [String: Int] {
+                let dictionaryRange = NSRange(
+                    dictionary.startIndex..<dictionary.endIndex,
+                    in: dictionary
+                )
+                var result: [String: Int] = [:]
+
+                for entry in fontEntryRegex.matches(
+                    in: dictionary,
+                    range: dictionaryRange
+                ) {
+                    guard let nameRange = Range(
+                        entry.range(at: 1),
+                        in: dictionary
+                    ),
+                    let objectRange = Range(
+                        entry.range(at: 2),
+                        in: dictionary
+                    ),
+                    let objectNumber = Int(dictionary[objectRange]),
+                    cmapByFontObject[objectNumber] != nil else {
+                        continue
+                    }
+                    result[String(dictionary[nameRange])] = objectNumber
+                }
+                return result
+            }
+
             let resourceRange = NSRange(
                 resourceText.startIndex..<resourceText.endIndex,
                 in: resourceText
             )
-            guard let fontMatch = fontDictionaryRegex.firstMatch(
+
+            // Inline form: /Font << /F1 4 0 R >>
+            if let fontMatch = fontDictionaryRegex.firstMatch(
                 in: resourceText,
                 range: resourceRange
             ),
-            let dictRange = Range(fontMatch.range(at: 1), in: resourceText) else {
-                return [:]
+            let dictRange = Range(fontMatch.range(at: 1), in: resourceText) {
+                return parseEntries(String(resourceText[dictRange]))
             }
 
-            let dictionary = String(resourceText[dictRange])
-            let dictionaryRange = NSRange(
-                dictionary.startIndex..<dictionary.endIndex,
-                in: dictionary
-            )
-            var result: [String: Int] = [:]
-
-            for entry in fontEntryRegex.matches(
-                in: dictionary,
-                range: dictionaryRange
-            ) {
-                guard let nameRange = Range(entry.range(at: 1), in: dictionary),
-                      let objectRange = Range(entry.range(at: 2), in: dictionary),
-                      let objectNumber = Int(dictionary[objectRange]),
-                      cmapByFontObject[objectNumber] != nil else {
-                    continue
-                }
-                result[String(dictionary[nameRange])] = objectNumber
+            // Indirect form: /Font 10 0 R, where object 10 is the font
+            // resource dictionary itself.
+            if let fontMatch = indirectFontDictionaryRegex.firstMatch(
+                in: resourceText,
+                range: resourceRange
+            ),
+            let objectRange = Range(fontMatch.range(at: 1), in: resourceText),
+            let generationRange = Range(fontMatch.range(at: 2), in: resourceText),
+            let objectNumber = Int(resourceText[objectRange]),
+            let generation = Int(resourceText[generationRange]),
+            let indirect = indirectObjectBody(objectNumber, generation) {
+                return parseEntries(indirect)
             }
-            return result
+
+            return [:]
         }
 
         func contentStreamKeys(in pageBody: String) -> [String] {
