@@ -654,8 +654,14 @@ enum MinimalPDFTextRewriter {
         guard let sectionRegex = try? NSRegularExpression(
             pattern: #"(?s)\d+\s+beginbfrange(.*?)endbfrange"#
         ),
-        let rangeRegex = try? NSRegularExpression(
+        let sequentialRegex = try? NSRegularExpression(
             pattern: #"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>"#
+        ),
+        let arrayRegex = try? NSRegularExpression(
+            pattern: #"(?s)<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[(.*?)\]"#
+        ),
+        let destinationRegex = try? NSRegularExpression(
+            pattern: #"<([0-9A-Fa-f]+)>"#
         ) else {
             return
         }
@@ -666,9 +672,12 @@ enum MinimalPDFTextRewriter {
                 continue
             }
             let section = String(cmap[sectionRange])
-            let range = NSRange(section.startIndex..<section.endIndex, in: section)
+            let sectionNSRange = NSRange(section.startIndex..<section.endIndex, in: section)
 
-            for match in rangeRegex.matches(in: section, range: range) {
+            // Sequential form:
+            // <0001> <0003> <4F60>
+            // maps each successive source code to successive UTF-16BE values.
+            for match in sequentialRegex.matches(in: section, range: sectionNSRange) {
                 guard let startRange = Range(match.range(at: 1), in: section),
                       let endRange = Range(match.range(at: 2), in: section),
                       let dstRange = Range(match.range(at: 3), in: section),
@@ -683,7 +692,6 @@ enum MinimalPDFTextRewriter {
                 }
 
                 let count = endValue - startValue
-                // Avoid pathological CMaps from exploding memory in this MVP.
                 guard count <= 65_535 else { continue }
 
                 for delta in 0...count {
@@ -700,6 +708,62 @@ enum MinimalPDFTextRewriter {
                         encoding: .utf16BigEndian
                     ),
                     !unicode.isEmpty else {
+                        continue
+                    }
+                    forward[sourceCode] = unicode
+                }
+            }
+
+            // Array form:
+            // <0001> <0003> [<4F60> <597D> <60A8>]
+            // maps each source code to the corresponding explicit Unicode
+            // destination. This is common in generated/subset-font PDFs.
+            for match in arrayRegex.matches(in: section, range: sectionNSRange) {
+                guard let startRange = Range(match.range(at: 1), in: section),
+                      let endRange = Range(match.range(at: 2), in: section),
+                      let arrayBodyRange = Range(match.range(at: 3), in: section),
+                      let sourceStart = decodeHexString(String(section[startRange])),
+                      let sourceEnd = decodeHexString(String(section[endRange])),
+                      sourceStart.count == sourceEnd.count,
+                      let startValue = integerValue(sourceStart),
+                      let endValue = integerValue(sourceEnd),
+                      endValue >= startValue else {
+                    continue
+                }
+
+                let arrayBody = String(section[arrayBodyRange])
+                let arrayNSRange = NSRange(
+                    arrayBody.startIndex..<arrayBody.endIndex,
+                    in: arrayBody
+                )
+                let destinations = destinationRegex.matches(
+                    in: arrayBody,
+                    range: arrayNSRange
+                )
+
+                let expectedCount = endValue - startValue + 1
+                guard expectedCount <= 65_536,
+                      destinations.count == Int(expectedCount) else {
+                    continue
+                }
+
+                for (index, destinationMatch) in destinations.enumerated() {
+                    guard let destinationRange = Range(
+                        destinationMatch.range(at: 1),
+                        in: arrayBody
+                    ),
+                    let destinationData = decodeHexString(
+                        String(arrayBody[destinationRange])
+                    ),
+                    let unicode = String(
+                        data: destinationData,
+                        encoding: .utf16BigEndian
+                    ),
+                    !unicode.isEmpty,
+                    let sourceCode = dataValue(
+                        startValue + UInt64(index),
+                        byteCount: sourceStart.count
+                    ) else {
                         continue
                     }
                     forward[sourceCode] = unicode
