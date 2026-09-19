@@ -360,15 +360,16 @@ public final class PDFContentEngine {
                 throw PDFContentError.notYetImplemented(
                     "同一文字對應多個 literal Tj；需要 object/byte-range identity 才可安全修改"
                 )
-            case .replacementChangesEncodedLength:
-                throw PDFContentError.notYetImplemented(
-                    "第一個 writeback milestone 只支援相同 encoded byte 長度的 replacement"
-                )
             case .unsupportedEncoding:
                 throw PDFContentError.notYetImplemented(
-                    "第一個 writeback milestone 只支援 printable ASCII literal Tj"
+                    "目前 writeback milestone 只支援 printable ASCII literal Tj"
                 )
-            case .unreadableFile, .writeFailed:
+            case .unsupportedFilter:
+                throw PDFContentError.notYetImplemented(
+                    "目前只支援未壓縮或 FlateDecode content stream"
+                )
+            case .unsupportedPDF, .decompressionFailed, .compressionFailed,
+                 .unreadableFile, .writeFailed:
                 throw PDFContentError.unsupportedContentWriteback
             }
         }
