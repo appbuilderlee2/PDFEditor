@@ -358,11 +358,11 @@ public final class PDFContentEngine {
                 throw PDFContentError.textNotFound
             case .ambiguousTarget:
                 throw PDFContentError.notYetImplemented(
-                    "同一文字對應多個 literal Tj；需要 object/byte-range identity 才可安全修改"
+                    "同一文字對應多個 Tj/TJ text object；需要 object/byte-range identity 才可安全修改"
                 )
             case .unsupportedEncoding:
                 throw PDFContentError.notYetImplemented(
-                    "目前 writeback milestone 只支援 printable ASCII literal Tj"
+                    "目前 writeback milestone 只支援 printable ASCII 的 literal Tj/TJ"
                 )
             case .unsupportedFilter:
                 throw PDFContentError.notYetImplemented(
