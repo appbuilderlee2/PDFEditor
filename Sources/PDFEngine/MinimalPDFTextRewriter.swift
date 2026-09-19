@@ -682,6 +682,9 @@ enum MinimalPDFTextRewriter {
         let indirectResourcesRegex = try NSRegularExpression(
             pattern: #"/Resources\s+(\d+)\s+(\d+)\s+R"#
         )
+        let parentRegex = try NSRegularExpression(
+            pattern: #"/Parent\s+(\d+)\s+(\d+)\s+R"#
+        )
         let indirectFontDictionaryRegex = try NSRegularExpression(
             pattern: #"/Font\s+(\d+)\s+(\d+)\s+R"#
         )
@@ -705,6 +708,80 @@ enum MinimalPDFTextRewriter {
                 return nil
             }
             return String(source[bodyRange])
+        }
+
+        func resourceText(for pageBody: String) -> String {
+            var current = pageBody
+            var visited: Set<String> = []
+
+            for _ in 0..<16 {
+                let currentRange = NSRange(
+                    current.startIndex..<current.endIndex,
+                    in: current
+                )
+
+                // An indirect /Resources dictionary wins at the current level.
+                if let resourceMatch = indirectResourcesRegex.firstMatch(
+                    in: current,
+                    range: currentRange
+                ),
+                let objectRange = Range(
+                    resourceMatch.range(at: 1),
+                    in: current
+                ),
+                let generationRange = Range(
+                    resourceMatch.range(at: 2),
+                    in: current
+                ),
+                let objectNumber = Int(current[objectRange]),
+                let generation = Int(current[generationRange]),
+                let indirect = indirectObjectBody(objectNumber, generation) {
+                    return indirect
+                }
+
+                // Inline resources can be consumed directly by fontObjects().
+                if current.range(
+                    of: #"/Resources\s*<<"#,
+                    options: .regularExpression
+                ) != nil {
+                    return current
+                }
+
+                // Page-tree inheritance: walk /Parent until a resources
+                // dictionary is found.
+                guard let parentMatch = parentRegex.firstMatch(
+                    in: current,
+                    range: currentRange
+                ),
+                let objectRange = Range(
+                    parentMatch.range(at: 1),
+                    in: current
+                ),
+                let generationRange = Range(
+                    parentMatch.range(at: 2),
+                    in: current
+                ),
+                let objectNumber = Int(current[objectRange]),
+                let generation = Int(current[generationRange]) else {
+                    break
+                }
+
+                let key = streamKey(
+                    objectNumber: objectNumber,
+                    generation: generation
+                )
+                guard !visited.contains(key),
+                      let parentBody = indirectObjectBody(
+                          objectNumber,
+                          generation
+                      ) else {
+                    break
+                }
+                visited.insert(key)
+                current = parentBody
+            }
+
+            return pageBody
         }
 
         func fontObjects(in resourceText: String) -> [String: Int] {
@@ -841,19 +918,7 @@ enum MinimalPDFTextRewriter {
                 in: pageBody
             )
 
-            var resourceText = pageBody
-            if let resourceMatch = indirectResourcesRegex.firstMatch(
-                in: pageBody,
-                range: pageNSRange
-            ),
-            let objectRange = Range(resourceMatch.range(at: 1), in: pageBody),
-            let generationRange = Range(resourceMatch.range(at: 2), in: pageBody),
-            let objectNumber = Int(pageBody[objectRange]),
-            let generation = Int(pageBody[generationRange]),
-            let indirect = indirectObjectBody(objectNumber, generation) {
-                resourceText = indirect
-            }
-
+            let resourceText = resourceText(for: pageBody)
             let pageFonts = fontObjects(in: resourceText)
             guard !pageFonts.isEmpty else { continue }
 
