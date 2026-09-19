@@ -151,6 +151,7 @@ enum MinimalPDFTextRewriter {
         }
 
         let streams = try parseStreamObjects(in: originalData)
+        let contentKeys = try pageContentStreamKeys(in: originalData)
         let toUnicodeCMaps = try type0ToUnicodeCMapsByResourceName(
             in: originalData,
             streams: streams
@@ -161,7 +162,8 @@ enum MinimalPDFTextRewriter {
         )
         var candidates: [Candidate] = []
 
-        for stream in latestStreamObjects(streams) {
+        for stream in latestStreamObjects(streams)
+        where contentKeys.contains(streamKey(stream)) {
             let decoded: Data
             if stream.isFlateEncoded {
                 decoded = try zlibDecode(stream.encodedData)
@@ -199,7 +201,8 @@ enum MinimalPDFTextRewriter {
         let context = try loadContext(from: fileURL)
         var objects: [TextObject] = []
 
-        for stream in latestStreamObjects(context.streams) {
+        for stream in latestStreamObjects(context.streams)
+        where context.pageContentStreamKeys.contains(streamKey(stream)) {
             let decoded = stream.isFlateEncoded
                 ? try zlibDecode(stream.encodedData)
                 : stream.encodedData
@@ -264,7 +267,8 @@ enum MinimalPDFTextRewriter {
         guard let stream = latestStreamObjects(context.streams).first(where: {
             $0.objectNumber == target.streamObjectNumber &&
             $0.generation == target.streamGeneration
-        }) else {
+        }),
+        context.pageContentStreamKeys.contains(streamKey(stream)) else {
             throw RewriteError.targetNotFound
         }
 
@@ -316,6 +320,7 @@ enum MinimalPDFTextRewriter {
     private struct RewriteContext {
         let originalData: Data
         let streams: [StreamObject]
+        let pageContentStreamKeys: Set<String>
         let toUnicodeCMaps: [String: ToUnicodeCMap]
         let toUnicodeCMapsByContentStream: [String: [String: ToUnicodeCMap]]
     }
@@ -341,6 +346,7 @@ enum MinimalPDFTextRewriter {
         }
 
         let streams = try parseStreamObjects(in: originalData)
+        let contentKeys = try pageContentStreamKeys(in: originalData)
         let maps = try type0ToUnicodeCMapsByResourceName(
             in: originalData,
             streams: streams
@@ -352,6 +358,7 @@ enum MinimalPDFTextRewriter {
         return RewriteContext(
             originalData: originalData,
             streams: streams,
+            pageContentStreamKeys: contentKeys,
             toUnicodeCMaps: maps,
             toUnicodeCMapsByContentStream: streamMaps
         )
@@ -555,6 +562,119 @@ enum MinimalPDFTextRewriter {
             return nil
         }
         return (objectNumber, generation)
+    }
+
+    /// Returns only streams referenced by the latest revision of each
+    /// /Type /Page object's /Contents entry. Non-page streams (ToUnicode,
+    /// metadata, images, unused/form streams) must never become text-edit
+    /// candidates merely because their bytes resemble Tj/TJ operators.
+    private static func pageContentStreamKeys(
+        in pdfData: Data
+    ) throws -> Set<String> {
+        guard let source = String(data: pdfData, encoding: .isoLatin1) else {
+            return []
+        }
+
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        let pageRegex = try NSRegularExpression(
+            pattern: #"(?s)(\d+)\s+(\d+)\s+obj\s*(<<(?:(?!endobj).)*?/Type\s*/Page\b(?:(?!endobj).)*?>>)\s*endobj"#
+        )
+        let contentsArrayRegex = try NSRegularExpression(
+            pattern: #"(?s)/Contents\s*\[(.*?)\]"#
+        )
+        let contentsDirectRegex = try NSRegularExpression(
+            pattern: #"/Contents\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let referenceRegex = try NSRegularExpression(
+            pattern: #"(\d+)\s+(\d+)\s+R"#
+        )
+
+        // Incremental PDFs can contain older revisions of the same Page
+        // object. The last textual revision wins, matching PDF semantics.
+        var latestPageBody: [String: String] = [:]
+
+        for match in pageRegex.matches(in: source, range: fullRange) {
+            guard let objectRange = Range(match.range(at: 1), in: source),
+                  let generationRange = Range(match.range(at: 2), in: source),
+                  let bodyRange = Range(match.range(at: 3), in: source),
+                  let objectNumber = Int(source[objectRange]),
+                  let generation = Int(source[generationRange]) else {
+                continue
+            }
+            latestPageBody[
+                streamKey(
+                    objectNumber: objectNumber,
+                    generation: generation
+                )
+            ] = String(source[bodyRange])
+        }
+
+        var result: Set<String> = []
+
+        for pageBody in latestPageBody.values {
+            let pageRange = NSRange(
+                pageBody.startIndex..<pageBody.endIndex,
+                in: pageBody
+            )
+
+            if let arrayMatch = contentsArrayRegex.firstMatch(
+                in: pageBody,
+                range: pageRange
+            ),
+            let arrayRange = Range(arrayMatch.range(at: 1), in: pageBody) {
+                let arrayBody = String(pageBody[arrayRange])
+                let arrayNSRange = NSRange(
+                    arrayBody.startIndex..<arrayBody.endIndex,
+                    in: arrayBody
+                )
+
+                for reference in referenceRegex.matches(
+                    in: arrayBody,
+                    range: arrayNSRange
+                ) {
+                    guard let objectRange = Range(
+                        reference.range(at: 1),
+                        in: arrayBody
+                    ),
+                    let generationRange = Range(
+                        reference.range(at: 2),
+                        in: arrayBody
+                    ),
+                    let objectNumber = Int(arrayBody[objectRange]),
+                    let generation = Int(arrayBody[generationRange]) else {
+                        continue
+                    }
+                    result.insert(
+                        streamKey(
+                            objectNumber: objectNumber,
+                            generation: generation
+                        )
+                    )
+                }
+                continue
+            }
+
+            if let directMatch = contentsDirectRegex.firstMatch(
+                in: pageBody,
+                range: pageRange
+            ),
+            let objectRange = Range(directMatch.range(at: 1), in: pageBody),
+            let generationRange = Range(
+                directMatch.range(at: 2),
+                in: pageBody
+            ),
+            let objectNumber = Int(pageBody[objectRange]),
+            let generation = Int(pageBody[generationRange]) {
+                result.insert(
+                    streamKey(
+                        objectNumber: objectNumber,
+                        generation: generation
+                    )
+                )
+            }
+        }
+
+        return result
     }
 
     // MARK: - Type0 / ToUnicode
