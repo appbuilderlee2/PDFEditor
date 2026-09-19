@@ -13,6 +13,7 @@ import Foundation
 /// - uncompressed streams
 /// - `/FlateDecode` streams
 /// - variable-length printable-ASCII replacements
+/// - direct and indirect stream `/Length` entries
 ///
 /// Deliberately not supported yet: hex strings inside `TJ` arrays, encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
@@ -174,7 +175,7 @@ enum MinimalPDFTextRewriter {
                 streamDataStart += 1
             }
 
-            guard let declaredLength = directStreamLength(in: dictionary),
+            guard let declaredLength = streamLength(in: dictionary, pdfBytes: bytes),
                   declaredLength >= 0,
                   streamDataStart + declaredLength <= bytes.count else {
                 // Indirect /Length objects are intentionally deferred until a
@@ -207,24 +208,75 @@ enum MinimalPDFTextRewriter {
         return results
     }
 
-    private static func directStreamLength(in dictionary: String) -> Int? {
-        let indirectPattern = #"/Length\s+\d+\s+\d+\s+R"#
-        if let indirectRegex = try? NSRegularExpression(pattern: indirectPattern),
-           indirectRegex.firstMatch(
+    private static func streamLength(
+        in dictionary: String,
+        pdfBytes: [UInt8]
+    ) -> Int? {
+        let indirectPattern = #"/Length\s+(\d+)\s+(\d+)\s+R"#
+        if let regex = try? NSRegularExpression(pattern: indirectPattern),
+           let match = regex.firstMatch(
                in: dictionary,
                range: NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
-           ) != nil {
-            return nil
+           ),
+           let objectRange = Range(match.range(at: 1), in: dictionary),
+           let generationRange = Range(match.range(at: 2), in: dictionary),
+           let objectNumber = Int(dictionary[objectRange]),
+           let generation = Int(dictionary[generationRange]) {
+            return resolveIndirectInteger(
+                objectNumber: objectNumber,
+                generation: generation,
+                in: pdfBytes
+            )
         }
 
-        let pattern = #"/Length\s+(\d+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let directPattern = #"/Length\s+(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: directPattern) else { return nil }
         let range = NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
         guard let match = regex.firstMatch(in: dictionary, range: range),
               let valueRange = Range(match.range(at: 1), in: dictionary) else {
             return nil
         }
         return Int(dictionary[valueRange])
+    }
+
+    private static func resolveIndirectInteger(
+        objectNumber: Int,
+        generation: Int,
+        in bytes: [UInt8]
+    ) -> Int? {
+        let header = Array("\(objectNumber) \(generation) obj".utf8)
+        let endMarker = Array("endobj".utf8)
+        var searchIndex = 0
+        var latestValue: Int?
+
+        while let headerIndex = find(header, in: bytes, from: searchIndex) {
+            // Require a token/line boundary before the object header so object
+            // numbers embedded in stream bytes are not mistaken for objects.
+            if headerIndex > 0 {
+                let previous = bytes[headerIndex - 1]
+                if previous != 0x0A && previous != 0x0D && previous != 0x20 {
+                    searchIndex = headerIndex + header.count
+                    continue
+                }
+            }
+
+            let bodyStart = headerIndex + header.count
+            guard let endIndex = find(endMarker, in: bytes, from: bodyStart) else { break }
+            let body = String(
+                bytes: bytes[bodyStart..<endIndex],
+                encoding: .ascii
+            )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let body,
+               let value = Int(body.split(whereSeparator: { $0.isWhitespace }).first ?? "") {
+                latestValue = value
+            }
+
+            searchIndex = endIndex + endMarker.count
+        }
+
+        // In an incremental PDF the latest revision wins.
+        return latestValue
     }
 
     private static func parseObjectHeader(_ text: String) -> (Int, Int)? {
@@ -601,15 +653,24 @@ enum MinimalPDFTextRewriter {
     }
 
     private static func replacingLength(in dictionary: String, with length: Int) -> String {
-        let pattern = #"/Length\s+\d+"#
-        if let regex = try? NSRegularExpression(pattern: pattern),
-           regex.firstMatch(
-               in: dictionary,
-               range: NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
-           ) != nil {
+        let fullRange = NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
+
+        let indirectPattern = #"/Length\s+\d+\s+\d+\s+R"#
+        if let regex = try? NSRegularExpression(pattern: indirectPattern),
+           regex.firstMatch(in: dictionary, range: fullRange) != nil {
             return regex.stringByReplacingMatches(
                 in: dictionary,
-                range: NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary),
+                range: fullRange,
+                withTemplate: "/Length \(length)"
+            )
+        }
+
+        let directPattern = #"/Length\s+\d+"#
+        if let regex = try? NSRegularExpression(pattern: directPattern),
+           regex.firstMatch(in: dictionary, range: fullRange) != nil {
+            return regex.stringByReplacingMatches(
+                in: dictionary,
+                range: fullRange,
                 withTemplate: "/Length \(length)"
             )
         }
