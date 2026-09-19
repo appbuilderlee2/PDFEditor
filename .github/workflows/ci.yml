@@ -4,7 +4,7 @@ name: macOS PDF Editor CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, phase2-text-writeback-mvp]
   pull_request:
     branches: [main, master]
 
