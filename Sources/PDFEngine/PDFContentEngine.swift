@@ -329,8 +329,50 @@ public final class PDFContentEngine {
         oldText: String,
         newText: String
     ) throws {
-        try validatePage(in: document, at: pageIndex)
-        throw PDFContentError.unsupportedContentWriteback
+        let page = try validatePage(in: document, at: pageIndex)
+        guard !oldText.isEmpty, page.string?.contains(oldText) == true else {
+            throw PDFContentError.textNotFound
+        }
+        guard let url = document.url else {
+            throw PDFContentError.unsupportedContentWriteback
+        }
+
+        do {
+            try MinimalPDFTextRewriter.replaceUniqueLiteralText(
+                in: url,
+                oldText: oldText,
+                newText: newText
+            )
+
+            // The writer edits the real PDF bytes on disk. Reload immediately
+            // so a later Save cannot overwrite the new content with the stale
+            // pre-edit PDFDocument object.
+            guard let reloaded = PDFDocument(url: url) else {
+                throw PDFContentError.unsupportedContentWriteback
+            }
+            document.pdfDocument = reloaded
+            document.isModified = false
+        } catch let error as MinimalPDFTextRewriter.RewriteError {
+            switch error {
+            case .targetNotFound:
+                throw PDFContentError.textNotFound
+            case .ambiguousTarget:
+                throw PDFContentError.notYetImplemented(
+                    "同一文字對應多個 Tj/TJ text object；需要 object/byte-range identity 才可安全修改"
+                )
+            case .unsupportedEncoding:
+                throw PDFContentError.notYetImplemented(
+                    "目前只能寫入原 PDF encoding / ToUnicode CMap 可表示的文字"
+                )
+            case .unsupportedFilter:
+                throw PDFContentError.notYetImplemented(
+                    "目前只支援未壓縮或 FlateDecode content stream"
+                )
+            case .unsupportedPDF, .decompressionFailed, .compressionFailed,
+                 .unreadableFile, .writeFailed:
+                throw PDFContentError.unsupportedContentWriteback
+            }
+        }
     }
 
     public func deleteText(

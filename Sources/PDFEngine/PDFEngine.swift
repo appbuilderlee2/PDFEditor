@@ -33,7 +33,7 @@ public final class PDFDocumentWrapper: Identifiable {
     // Optional for source compatibility with existing callers. Engine-created
     // wrappers always contain a document; no lazy reload or associated storage
     // is used.
-    public let pdfDocument: PDFDocument?
+    public var pdfDocument: PDFDocument?
 
     public init(
         id: UUID = UUID(),
