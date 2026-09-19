@@ -414,6 +414,38 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
+    func testType0IdentityHToUnicodeCIDTJArrayWriteback() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("type0-tounicode-tj-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeType0ToUnicodePDF(
+            to: url,
+            compressed: true,
+            useTJArray: true
+        )
+
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Type0 TJ fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("你好100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "你好100",
+            newText: "您好1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Rewritten Type0 TJ PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("您好1200"))
+        XCTAssertFalse(extracted.contains("你好100"))
+    }
+
     func testIndirectLengthCompressedWriteback() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("indirect-length-\(UUID().uuidString).pdf")
@@ -479,9 +511,13 @@ final class PDFEditorTests: XCTestCase {
 
     private func writeType0ToUnicodePDF(
         to url: URL,
-        compressed: Bool
+        compressed: Bool,
+        useTJArray: Bool = false
     ) throws {
-        let content = "BT\n/F1 16 Tf\n72 720 Td\n<00010002001000120012> Tj\nET\n"
+        let textOperator = useTJArray
+            ? "[<0001> -25 <0002> 10 <001000120012>] TJ"
+            : "<00010002001000120012> Tj"
+        let content = "BT\n/F1 16 Tf\n72 720 Td\n\(textOperator)\nET\n"
         guard let contentPlain = content.data(using: .ascii) else {
             throw NSError(domain: "PDFEditorTests", code: 10)
         }
