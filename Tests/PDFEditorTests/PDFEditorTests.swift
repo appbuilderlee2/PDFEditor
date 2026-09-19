@@ -265,15 +265,15 @@ final class PDFEditorTests: XCTestCase {
         try PDFContentEngine.shared.replaceText(
             document: wrapper,
             pageIndex: 0,
-            oldText: "100",
-            newText: "1200"
+            oldText: "Hello 100",
+            newText: "Hi 1200"
         )
 
         guard let reopened = PDFDocument(url: url) else {
             return XCTFail("Compressed rewritten TJ PDF should reopen")
         }
         let extracted = reopened.page(at: 0)?.string ?? ""
-        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertTrue(extracted.contains("Hi 1200"))
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
