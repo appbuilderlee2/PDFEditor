@@ -126,8 +126,13 @@ final class PDFEditorTests: XCTestCase {
 
         let rawData = try Data(contentsOf: url)
         let raw = String(data: rawData, encoding: .isoLatin1) ?? ""
+        // Incremental update intentionally preserves the previous PDF revision
+        // while the newest xref points at the replacement stream object.
         XCTAssertTrue(raw.contains("(Hello 120) Tj"))
-        XCTAssertFalse(raw.contains("(Hello 100) Tj"))
+        XCTAssertGreaterThanOrEqual(
+            raw.components(separatedBy: "startxref").count - 1,
+            2
+        )
     }
 
     func testExistingLiteralTextWritebackSupportsLengthChange() throws {
@@ -181,6 +186,35 @@ final class PDFEditorTests: XCTestCase {
         let extracted = reopened.page(at: 0)?.string ?? ""
         XCTAssertTrue(extracted.contains("Hello 1200"))
         XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
+    func testAmbiguousWritebackFailsWithoutCorruptingPDF() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PDFEditor-ambiguous-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeMinimalLiteralTextPDF(to: url, text: "100 and 100")
+        let before = try Data(contentsOf: url)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Fixture PDF should open")
+        }
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        XCTAssertThrowsError(
+            try PDFContentEngine.shared.replaceText(
+                document: wrapper,
+                pageIndex: 0,
+                oldText: "100",
+                newText: "1200"
+            )
+        )
+
+        let after = try Data(contentsOf: url)
+        XCTAssertEqual(before, after)
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Failed writeback must leave a valid PDF")
+        }
+        XCTAssertTrue(reopened.page(at: 0)?.string?.contains("100 and 100") == true)
     }
 
     private func writeMinimalLiteralTextPDF(
