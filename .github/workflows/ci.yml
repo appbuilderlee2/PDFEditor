@@ -20,9 +20,9 @@ jobs:
           fetch-depth: 1
 
       - name: Select Swift version
-        uses: swift-actions/setup-swift@v1
-        with:
-          swift-version: '6.0'
+        run: |
+          swift --version
+          xcodebuild -version
 
       - name: Resolve dependencies
         run: |
