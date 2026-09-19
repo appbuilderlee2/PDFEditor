@@ -19,6 +19,26 @@ import Foundation
 /// Deliberately not supported yet: encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
 enum MinimalPDFTextRewriter {
+    struct TextObjectID: Hashable {
+        let streamObjectNumber: Int
+        let streamGeneration: Int
+        let operatorStartOffset: Int
+        let operatorEndOffset: Int
+    }
+
+    enum TextOperatorKind: String {
+        case literalTj
+        case hexTj
+        case tjArray
+    }
+
+    struct TextObject: Identifiable, Equatable {
+        let id: TextObjectID
+        let text: String
+        let fontResourceName: String?
+        let kind: TextOperatorKind
+    }
+
     enum RewriteError: Error, Equatable {
         case unsupportedEncoding
         case unsupportedPDF
@@ -102,7 +122,7 @@ enum MinimalPDFTextRewriter {
         )
         var candidates: [Candidate] = []
 
-        for stream in streams {
+        for stream in latestStreamObjects(streams) {
             let decoded: Data
             if stream.isFlateEncoded {
                 decoded = try zlibDecode(stream.encodedData)
@@ -126,33 +146,177 @@ enum MinimalPDFTextRewriter {
         guard candidates.count == 1 else { throw RewriteError.ambiguousTarget }
 
         let candidate = candidates[0]
-        let newEncodedData = candidate.stream.isFlateEncoded
-            ? try zlibEncode(candidate.rewrittenDecodedData)
-            : candidate.rewrittenDecodedData
-
-        let previousXref = try lastStartXref(in: originalData)
-        let trailer = try trailerInfo(in: originalData)
-        let rewrittenDictionary = replacingLength(
-            in: candidate.stream.dictionary,
-            with: newEncodedData.count
-        )
-
-        let updatedData = makeIncrementalRevision(
+        try writeIncrementalStreamRevision(
             originalData: originalData,
-            objectNumber: candidate.stream.objectNumber,
-            generation: candidate.stream.generation,
-            dictionary: rewrittenDictionary,
-            streamData: newEncodedData,
-            previousXref: previousXref,
-            trailerSize: max(trailer.size, candidate.stream.objectNumber + 1),
-            rootObjectNumber: trailer.rootObjectNumber,
-            rootGeneration: trailer.rootGeneration
+            stream: candidate.stream,
+            rewrittenDecodedData: candidate.rewrittenDecodedData,
+            fileURL: fileURL
         )
+    }
 
-        do {
-            try updatedData.write(to: fileURL, options: .atomic)
-        } catch {
-            throw RewriteError.writeFailed
+    static func textObjects(in fileURL: URL) throws -> [TextObject] {
+        let context = try loadContext(from: fileURL)
+        var objects: [TextObject] = []
+
+        for stream in latestStreamObjects(context.streams) {
+            let decoded = stream.isFlateEncoded
+                ? try zlibDecode(stream.encodedData)
+                : stream.encodedData
+
+            guard let source = String(data: decoded, encoding: .isoLatin1) else {
+                continue
+            }
+
+            let regex = try textOperatorRegex()
+            let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+
+            for result in regex.matches(in: source, range: fullRange) {
+                guard let wholeRange = Range(result.range, in: source) else { continue }
+                let whole = String(source[wholeRange])
+                let fontResourceName = currentFontResourceName(
+                    in: source,
+                    before: wholeRange.lowerBound
+                )
+                let cmap =
+                    fontResourceName.flatMap { context.toUnicodeCMaps[$0] } ??
+                    context.toUnicodeCMaps["__single_type0_fallback__"]
+
+                guard let parsed = try parseVisibleTextOperator(
+                    whole,
+                    toUnicodeCMap: cmap
+                ) else {
+                    continue
+                }
+
+                let startOffset = latin1ByteCount(source[..<wholeRange.lowerBound])
+                let endOffset = startOffset + latin1ByteCount(source[wholeRange])
+
+                objects.append(
+                    TextObject(
+                        id: TextObjectID(
+                            streamObjectNumber: stream.objectNumber,
+                            streamGeneration: stream.generation,
+                            operatorStartOffset: startOffset,
+                            operatorEndOffset: endOffset
+                        ),
+                        text: parsed.text,
+                        fontResourceName: fontResourceName,
+                        kind: parsed.kind
+                    )
+                )
+            }
+        }
+
+        return objects
+    }
+
+    static func replaceText(
+        in fileURL: URL,
+        target: TextObjectID,
+        oldText: String,
+        newText: String
+    ) throws {
+        guard !oldText.isEmpty else { throw RewriteError.unsupportedEncoding }
+        let context = try loadContext(from: fileURL)
+
+        guard let stream = latestStreamObjects(context.streams).first(where: {
+            $0.objectNumber == target.streamObjectNumber &&
+            $0.generation == target.streamGeneration
+        }) else {
+            throw RewriteError.targetNotFound
+        }
+
+        let decoded = stream.isFlateEncoded
+            ? try zlibDecode(stream.encodedData)
+            : stream.encodedData
+
+        guard var source = String(data: decoded, encoding: .isoLatin1),
+              let wholeRange = latin1StringRange(
+                  in: source,
+                  startOffset: target.operatorStartOffset,
+                  endOffset: target.operatorEndOffset
+              ) else {
+            throw RewriteError.targetNotFound
+        }
+
+        let whole = String(source[wholeRange])
+        let fontResourceName = currentFontResourceName(
+            in: source,
+            before: wholeRange.lowerBound
+        )
+        let cmap =
+            fontResourceName.flatMap { context.toUnicodeCMaps[$0] } ??
+            context.toUnicodeCMaps["__single_type0_fallback__"]
+
+        guard let replacement = try rewriteSpecificTextOperator(
+            whole,
+            oldText: oldText,
+            newText: newText,
+            toUnicodeCMap: cmap
+        ) else {
+            throw RewriteError.targetNotFound
+        }
+
+        source.replaceSubrange(wholeRange, with: replacement)
+        guard let rewrittenDecoded = source.data(using: .isoLatin1) else {
+            throw RewriteError.unsupportedEncoding
+        }
+
+        try writeIncrementalStreamRevision(
+            originalData: context.originalData,
+            stream: stream,
+            rewrittenDecodedData: rewrittenDecoded,
+            fileURL: fileURL
+        )
+    }
+
+    private struct RewriteContext {
+        let originalData: Data
+        let streams: [StreamObject]
+        let toUnicodeCMaps: [String: ToUnicodeCMap]
+    }
+
+    private static func loadContext(from fileURL: URL) throws -> RewriteContext {
+        guard fileURL.isFileURL,
+              let originalData = try? Data(contentsOf: fileURL),
+              !originalData.isEmpty else {
+            throw RewriteError.unreadableFile
+        }
+
+        let headerText = String(
+            decoding: originalData.prefix(min(originalData.count, 4096)),
+            as: UTF8.self
+        )
+        guard headerText.contains("%PDF-") else {
+            throw RewriteError.unsupportedPDF
+        }
+
+        let latin1 = String(data: originalData, encoding: .isoLatin1) ?? ""
+        guard !latin1.contains("/Encrypt") else {
+            throw RewriteError.unsupportedPDF
+        }
+
+        let streams = try parseStreamObjects(in: originalData)
+        let maps = try type0ToUnicodeCMapsByResourceName(
+            in: originalData,
+            streams: streams
+        )
+        return RewriteContext(
+            originalData: originalData,
+            streams: streams,
+            toUnicodeCMaps: maps
+        )
+    }
+
+    private static func latestStreamObjects(_ streams: [StreamObject]) -> [StreamObject] {
+        var latestIndex: [String: Int] = [:]
+        for (index, stream) in streams.enumerated() {
+            latestIndex["\(stream.objectNumber):\(stream.generation)"] = index
+        }
+
+        return streams.enumerated().compactMap { index, stream in
+            let key = "\(stream.objectNumber):\(stream.generation)"
+            return latestIndex[key] == index ? stream : nil
         }
     }
 
@@ -1046,6 +1210,42 @@ enum MinimalPDFTextRewriter {
         }
 
         return results
+    }
+
+    private static func writeIncrementalStreamRevision(
+        originalData: Data,
+        stream: StreamObject,
+        rewrittenDecodedData: Data,
+        fileURL: URL
+    ) throws {
+        let newEncodedData = stream.isFlateEncoded
+            ? try zlibEncode(rewrittenDecodedData)
+            : rewrittenDecodedData
+
+        let previousXref = try lastStartXref(in: originalData)
+        let trailer = try trailerInfo(in: originalData)
+        let rewrittenDictionary = replacingLength(
+            in: stream.dictionary,
+            with: newEncodedData.count
+        )
+
+        let updatedData = makeIncrementalRevision(
+            originalData: originalData,
+            objectNumber: stream.objectNumber,
+            generation: stream.generation,
+            dictionary: rewrittenDictionary,
+            streamData: newEncodedData,
+            previousXref: previousXref,
+            trailerSize: max(trailer.size, stream.objectNumber + 1),
+            rootObjectNumber: trailer.rootObjectNumber,
+            rootGeneration: trailer.rootGeneration
+        )
+
+        do {
+            try updatedData.write(to: fileURL, options: .atomic)
+        } catch {
+            throw RewriteError.writeFailed
+        }
     }
 
     // MARK: - Incremental PDF update
