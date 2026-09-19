@@ -758,6 +758,42 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
+    func testUnreferencedDecoyStreamIsNotTextCandidate() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("unreferenced-decoy-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writePageWithUnreferencedDecoyPDF(to: url)
+
+        guard let original = PDFDocument(url: url) else {
+            return XCTFail("Decoy fixture should open")
+        }
+        XCTAssertTrue((original.page(at: 0)?.string ?? "").contains("100"))
+
+        // Only the actual Page /Contents stream is exposed as editable.
+        let beforeObjects = try MinimalPDFTextRewriter.textObjects(in: url)
+        XCTAssertEqual(beforeObjects.filter { $0.text == "100" }.count, 1)
+
+        // Legacy unique replacement must not become ambiguous merely because
+        // an unrelated stream contains identical Tj bytes.
+        try MinimalPDFTextRewriter.replaceUniqueLiteralText(
+            in: url,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Decoy rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("1200"))
+        XCTAssertFalse(extracted.contains("100"))
+
+        let afterObjects = try MinimalPDFTextRewriter.textObjects(in: url)
+        XCTAssertEqual(afterObjects.filter { $0.text == "1200" }.count, 1)
+        XCTAssertEqual(afterObjects.filter { $0.text == "100" }.count, 0)
+    }
+
     func testAmbiguousWritebackFailsWithoutCorruptingPDF() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("PDFEditor-ambiguous-\(UUID().uuidString).pdf")
@@ -1219,6 +1255,74 @@ final class PDFEditorTests: XCTestCase {
         )
 
         let objectCount = 12
+        let xrefOffset = pdf.count
+        pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
+        pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
+        for number in 1...objectCount {
+            pdf.append(
+                contentsOf: String(
+                    format: "%010d 00000 n \n",
+                    offsets[number]
+                ).utf8
+            )
+        }
+        pdf.append(
+            contentsOf: "trailer\n<< /Size \(objectCount + 1) /Root 1 0 R >>\n".utf8
+        )
+        pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
+
+        try pdf.write(to: url, options: .atomic)
+    }
+
+    private func writePageWithUnreferencedDecoyPDF(
+        to url: URL
+    ) throws {
+        let pageContent = "BT\n/F1 12 Tf\n72 720 Td\n(100) Tj\nET\n"
+        let decoyContent = "BT\n/F1 12 Tf\n72 700 Td\n(100) Tj\nET\n"
+
+        guard let pageData = pageContent.data(using: .ascii),
+              let decoyData = decoyContent.data(using: .ascii) else {
+            throw NSError(domain: "PDFEditorTests", code: 60)
+        }
+
+        var pdf = Data("%PDF-1.4\n".utf8)
+        var offsets = [Int](repeating: -1, count: 7)
+
+        func appendObject(_ number: Int, header: String, stream: Data? = nil) {
+            offsets[number] = pdf.count
+            pdf.append(contentsOf: "\(number) 0 obj\n".utf8)
+            pdf.append(contentsOf: header.utf8)
+            if let stream {
+                pdf.append(contentsOf: "\nstream\n".utf8)
+                pdf.append(stream)
+                pdf.append(contentsOf: "\nendstream".utf8)
+            }
+            pdf.append(contentsOf: "\nendobj\n".utf8)
+        }
+
+        appendObject(1, header: "<< /Type /Catalog /Pages 2 0 R >>")
+        appendObject(2, header: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        appendObject(
+            3,
+            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        )
+        appendObject(
+            4,
+            header: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+        )
+        appendObject(
+            5,
+            header: "<< /Length \(pageData.count) >>",
+            stream: pageData
+        )
+        // Intentionally not referenced by Page /Contents or any Form XObject.
+        appendObject(
+            6,
+            header: "<< /Length \(decoyData.count) >>",
+            stream: decoyData
+        )
+
+        let objectCount = 6
         let xrefOffset = pdf.count
         pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
         pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
