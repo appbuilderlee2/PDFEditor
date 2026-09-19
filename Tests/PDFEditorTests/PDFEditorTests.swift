@@ -551,6 +551,41 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
+    func testInheritedPageTreeResourcesUseBranchSpecificCMap() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inherited-page-resources-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeTwoPageInheritedResourceType0PDF(to: url)
+
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Inherited-resource fixture should open")
+        }
+        XCTAssertEqual(pdf.pageCount, 2)
+        XCTAssertTrue((pdf.page(at: 0)?.string ?? "").contains("你100"))
+        XCTAssertTrue((pdf.page(at: 1)?.string ?? "").contains("您100"))
+
+        let objects = try MinimalPDFTextRewriter.textObjects(in: url)
+        XCTAssertNotNil(objects.first { $0.text == "你100" })
+        guard let target = objects.first(where: { $0.text == "您100" }) else {
+            return XCTFail("Inherited second-page CMap should resolve")
+        }
+
+        try MinimalPDFTextRewriter.replaceText(
+            in: url,
+            target: target.id,
+            oldText: "您100",
+            newText: "好1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Inherited-resource rewritten PDF should reopen")
+        }
+        XCTAssertTrue((reopened.page(at: 0)?.string ?? "").contains("你100"))
+        XCTAssertTrue((reopened.page(at: 1)?.string ?? "").contains("好1200"))
+        XCTAssertFalse((reopened.page(at: 1)?.string ?? "").contains("您100"))
+    }
+
     func testSameF1OnDifferentPagesUsesPageSpecificCMap() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("page-specific-f1-\(UUID().uuidString).pdf")
@@ -713,6 +748,164 @@ final class PDFEditorTests: XCTestCase {
             return XCTFail("Failed writeback must leave a valid PDF")
         }
         XCTAssertTrue(reopened.page(at: 0)?.string?.contains("100 and 100") == true)
+    }
+
+    private func writeTwoPageInheritedResourceType0PDF(
+        to url: URL
+    ) throws {
+        let content1 = "BT\n/F1 16 Tf\n72 720 Td\n<0001001100100010> Tj\nET\n"
+        let content2 = "BT\n/F1 16 Tf\n72 720 Td\n<0001001100100010> Tj\nET\n"
+        guard let content1Plain = content1.data(using: .ascii),
+              let content2Plain = content2.data(using: .ascii) else {
+            throw NSError(domain: "PDFEditorTests", code: 40)
+        }
+
+        let content1Data = try zlibEncodeForFixture(content1Plain)
+        let content2Data = try zlibEncodeForFixture(content2Plain)
+
+        let cmapA = """
+        /CIDInit /ProcSet findresource begin
+        12 dict begin
+        begincmap
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+        /CMapName /InheritedOne-UCS def
+        /CMapType 2 def
+        1 begincodespacerange
+        <0000> <FFFF>
+        endcodespacerange
+        2 beginbfchar
+        <0001> <4F60>
+        <0002> <597D>
+        endbfchar
+        1 beginbfrange
+        <0010> <0012> <0030>
+        endbfrange
+        endcmap
+        CMapName currentdict /CMap defineresource pop
+        end
+        end
+        """
+        let cmapB = """
+        /CIDInit /ProcSet findresource begin
+        12 dict begin
+        begincmap
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+        /CMapName /InheritedTwo-UCS def
+        /CMapType 2 def
+        1 begincodespacerange
+        <0000> <FFFF>
+        endcodespacerange
+        2 beginbfchar
+        <0001> <60A8>
+        <0002> <597D>
+        endbfchar
+        1 beginbfrange
+        <0010> <0012> <0030>
+        endbfrange
+        endcmap
+        CMapName currentdict /CMap defineresource pop
+        end
+        end
+        """
+
+        guard let cmapAPlain = cmapA.data(using: .ascii),
+              let cmapBPlain = cmapB.data(using: .ascii) else {
+            throw NSError(domain: "PDFEditorTests", code: 41)
+        }
+        let cmapAData = try zlibEncodeForFixture(cmapAPlain)
+        let cmapBData = try zlibEncodeForFixture(cmapBPlain)
+
+        var pdf = Data("%PDF-1.4\n".utf8)
+        var offsets = [Int](repeating: -1, count: 15)
+
+        func appendObject(_ number: Int, header: String, stream: Data? = nil) {
+            offsets[number] = pdf.count
+            pdf.append(contentsOf: "\(number) 0 obj\n".utf8)
+            pdf.append(contentsOf: header.utf8)
+            if let stream {
+                pdf.append(contentsOf: "\nstream\n".utf8)
+                pdf.append(stream)
+                pdf.append(contentsOf: "\nendstream".utf8)
+            }
+            pdf.append(contentsOf: "\nendobj\n".utf8)
+        }
+
+        appendObject(1, header: "<< /Type /Catalog /Pages 2 0 R >>")
+        appendObject(
+            2,
+            header: "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"
+        )
+        appendObject(
+            3,
+            header: "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /Resources << /Font << /F1 7 0 R >> >> >>"
+        )
+        appendObject(
+            4,
+            header: "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 /Resources << /Font << /F1 8 0 R >> >> >>"
+        )
+        appendObject(
+            5,
+            header: "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 13 0 R >>"
+        )
+        appendObject(
+            6,
+            header: "<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] /Contents 14 0 R >>"
+        )
+        appendObject(
+            7,
+            header: "<< /Type /Font /Subtype /Type0 /BaseFont /InheritedOne /Encoding /Identity-H /DescendantFonts [9 0 R] /ToUnicode 11 0 R >>"
+        )
+        appendObject(
+            8,
+            header: "<< /Type /Font /Subtype /Type0 /BaseFont /InheritedTwo /Encoding /Identity-H /DescendantFonts [9 0 R] /ToUnicode 12 0 R >>"
+        )
+        appendObject(
+            9,
+            header: "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 10 0 R /DW 1000 /CIDToGIDMap /Identity >>"
+        )
+        appendObject(
+            10,
+            header: "<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>"
+        )
+        appendObject(
+            11,
+            header: "<< /Length \(cmapAData.count) /Filter /FlateDecode >>",
+            stream: cmapAData
+        )
+        appendObject(
+            12,
+            header: "<< /Length \(cmapBData.count) /Filter /FlateDecode >>",
+            stream: cmapBData
+        )
+        appendObject(
+            13,
+            header: "<< /Length \(content1Data.count) /Filter /FlateDecode >>",
+            stream: content1Data
+        )
+        appendObject(
+            14,
+            header: "<< /Length \(content2Data.count) /Filter /FlateDecode >>",
+            stream: content2Data
+        )
+
+        let objectCount = 14
+        let xrefOffset = pdf.count
+        pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
+        pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
+        for number in 1...objectCount {
+            pdf.append(
+                contentsOf: String(
+                    format: "%010d 00000 n \n",
+                    offsets[number]
+                ).utf8
+            )
+        }
+        pdf.append(
+            contentsOf: "trailer\n<< /Size \(objectCount + 1) /Root 1 0 R >>\n".utf8
+        )
+        pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
+
+        try pdf.write(to: url, options: .atomic)
     }
 
     private func writeTwoPageSameResourceDifferentType0PDF(
