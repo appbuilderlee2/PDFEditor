@@ -151,7 +151,7 @@ enum MinimalPDFTextRewriter {
         }
 
         let streams = try parseStreamObjects(in: originalData)
-        let contentKeys = try pageContentStreamKeys(in: originalData)
+        let contentKeys = try pageContentStreamKeys(in: originalData, streams: streams)
         let toUnicodeCMaps = try type0ToUnicodeCMapsByResourceName(
             in: originalData,
             streams: streams
@@ -346,7 +346,7 @@ enum MinimalPDFTextRewriter {
         }
 
         let streams = try parseStreamObjects(in: originalData)
-        let contentKeys = try pageContentStreamKeys(in: originalData)
+        let contentKeys = try pageContentStreamKeys(in: originalData, streams: streams)
         let maps = try type0ToUnicodeCMapsByResourceName(
             in: originalData,
             streams: streams
@@ -569,7 +569,8 @@ enum MinimalPDFTextRewriter {
     /// metadata, images, unused/form streams) must never become text-edit
     /// candidates merely because their bytes resemble Tj/TJ operators.
     private static func pageContentStreamKeys(
-        in pdfData: Data
+        in pdfData: Data,
+        streams: [StreamObject]
     ) throws -> Set<String> {
         guard let source = String(data: pdfData, encoding: .isoLatin1) else {
             return []
@@ -588,34 +589,136 @@ enum MinimalPDFTextRewriter {
         let referenceRegex = try NSRegularExpression(
             pattern: #"(\d+)\s+(\d+)\s+R"#
         )
+        let indirectResourcesRegex = try NSRegularExpression(
+            pattern: #"/Resources\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let xObjectDictionaryRegex = try NSRegularExpression(
+            pattern: #"(?s)/XObject\s*<<(.+?)>>"#
+        )
+        let indirectXObjectDictionaryRegex = try NSRegularExpression(
+            pattern: #"/XObject\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let xObjectEntryRegex = try NSRegularExpression(
+            pattern: #"/([^\s/<>\[\]()]+)\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let doRegex = try NSRegularExpression(
+            pattern: #"/([^\s/<>\[\]()]+)\s+Do\b"#
+        )
 
-        // Incremental PDFs can contain older revisions of the same Page
-        // object. The last textual revision wins, matching PDF semantics.
-        var latestPageBody: [String: String] = [:]
-
-        for match in pageRegex.matches(in: source, range: fullRange) {
-            guard let objectRange = Range(match.range(at: 1), in: source),
-                  let generationRange = Range(match.range(at: 2), in: source),
-                  let bodyRange = Range(match.range(at: 3), in: source),
-                  let objectNumber = Int(source[objectRange]),
-                  let generation = Int(source[generationRange]) else {
-                continue
+        func indirectObjectBody(
+            _ objectNumber: Int,
+            _ generation: Int
+        ) -> String? {
+            let pattern = #"(?s)(?:^|[\r\n])"# +
+                String(objectNumber) + #"\s+"# +
+                String(generation) + #"\s+obj\s*(.*?)\s*endobj"#
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.matches(in: source, range: fullRange).last,
+                  let bodyRange = Range(match.range(at: 1), in: source) else {
+                return nil
             }
-            latestPageBody[
-                streamKey(
+            return String(source[bodyRange])
+        }
+
+        func resolvedResourceText(_ ownerText: String) -> String {
+            let ownerRange = NSRange(
+                ownerText.startIndex..<ownerText.endIndex,
+                in: ownerText
+            )
+            if let match = indirectResourcesRegex.firstMatch(
+                in: ownerText,
+                range: ownerRange
+            ),
+            let objectRange = Range(match.range(at: 1), in: ownerText),
+            let generationRange = Range(match.range(at: 2), in: ownerText),
+            let objectNumber = Int(ownerText[objectRange]),
+            let generation = Int(ownerText[generationRange]),
+            let body = indirectObjectBody(objectNumber, generation) {
+                return body
+            }
+            return ownerText
+        }
+
+        func xObjectMap(in resourceText: String) -> [String: String] {
+            let resourceRange = NSRange(
+                resourceText.startIndex..<resourceText.endIndex,
+                in: resourceText
+            )
+
+            let dictionary: String
+            if let match = xObjectDictionaryRegex.firstMatch(
+                in: resourceText,
+                range: resourceRange
+            ),
+            let dictRange = Range(match.range(at: 1), in: resourceText) {
+                dictionary = String(resourceText[dictRange])
+            } else if let match = indirectXObjectDictionaryRegex.firstMatch(
+                in: resourceText,
+                range: resourceRange
+            ),
+            let objectRange = Range(match.range(at: 1), in: resourceText),
+            let generationRange = Range(match.range(at: 2), in: resourceText),
+            let objectNumber = Int(resourceText[objectRange]),
+            let generation = Int(resourceText[generationRange]),
+            let body = indirectObjectBody(objectNumber, generation) {
+                dictionary = body
+            } else {
+                return [:]
+            }
+
+            let dictionaryRange = NSRange(
+                dictionary.startIndex..<dictionary.endIndex,
+                in: dictionary
+            )
+            var result: [String: String] = [:]
+
+            for entry in xObjectEntryRegex.matches(
+                in: dictionary,
+                range: dictionaryRange
+            ) {
+                guard let nameRange = Range(entry.range(at: 1), in: dictionary),
+                      let objectRange = Range(
+                          entry.range(at: 2),
+                          in: dictionary
+                      ),
+                      let generationRange = Range(
+                          entry.range(at: 3),
+                          in: dictionary
+                      ),
+                      let objectNumber = Int(dictionary[objectRange]),
+                      let generation = Int(dictionary[generationRange]) else {
+                    continue
+                }
+                result[String(dictionary[nameRange])] = streamKey(
                     objectNumber: objectNumber,
                     generation: generation
                 )
-            ] = String(source[bodyRange])
+            }
+            return result
         }
 
-        var result: Set<String> = []
+        func referencedDoNames(in stream: StreamObject) throws -> [String] {
+            let decoded = stream.isFlateEncoded
+                ? try zlibDecode(stream.encodedData)
+                : stream.encodedData
+            guard let text = String(data: decoded, encoding: .isoLatin1) else {
+                return []
+            }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            return doRegex.matches(in: text, range: range).compactMap {
+                guard let nameRange = Range($0.range(at: 1), in: text) else {
+                    return nil
+                }
+                return String(text[nameRange])
+            }
+        }
 
-        for pageBody in latestPageBody.values {
+        func contentStreamKeys(in pageBody: String) -> [String] {
             let pageRange = NSRange(
                 pageBody.startIndex..<pageBody.endIndex,
                 in: pageBody
             )
+            var keys: [String] = []
 
             if let arrayMatch = contentsArrayRegex.firstMatch(
                 in: pageBody,
@@ -627,7 +730,6 @@ enum MinimalPDFTextRewriter {
                     arrayBody.startIndex..<arrayBody.endIndex,
                     in: arrayBody
                 )
-
                 for reference in referenceRegex.matches(
                     in: arrayBody,
                     range: arrayNSRange
@@ -644,14 +746,14 @@ enum MinimalPDFTextRewriter {
                     let generation = Int(arrayBody[generationRange]) else {
                         continue
                     }
-                    result.insert(
+                    keys.append(
                         streamKey(
                             objectNumber: objectNumber,
                             generation: generation
                         )
                     )
                 }
-                continue
+                return keys
             }
 
             if let directMatch = contentsDirectRegex.firstMatch(
@@ -665,12 +767,96 @@ enum MinimalPDFTextRewriter {
             ),
             let objectNumber = Int(pageBody[objectRange]),
             let generation = Int(pageBody[generationRange]) {
-                result.insert(
+                keys.append(
                     streamKey(
                         objectNumber: objectNumber,
                         generation: generation
                     )
                 )
+            }
+            return keys
+        }
+
+        // Incremental PDFs can contain older revisions of the same Page
+        // object. The last textual revision wins.
+        var latestPageBody: [String: String] = [:]
+        for match in pageRegex.matches(in: source, range: fullRange) {
+            guard let objectRange = Range(match.range(at: 1), in: source),
+                  let generationRange = Range(match.range(at: 2), in: source),
+                  let bodyRange = Range(match.range(at: 3), in: source),
+                  let objectNumber = Int(source[objectRange]),
+                  let generation = Int(source[generationRange]) else {
+                continue
+            }
+            latestPageBody[
+                streamKey(
+                    objectNumber: objectNumber,
+                    generation: generation
+                )
+            ] = String(source[bodyRange])
+        }
+
+        let latestStreams = latestStreamObjects(streams)
+        let streamByKey = Dictionary(
+            uniqueKeysWithValues: latestStreams.map { (streamKey($0), $0) }
+        )
+
+        var result: Set<String> = []
+
+        for pageBody in latestPageBody.values {
+            let resourceText = resolvedResourceText(pageBody)
+            let pageXObjects = xObjectMap(in: resourceText)
+            var queue: [(key: String, resources: String)] = []
+
+            for key in contentStreamKeys(in: pageBody) {
+                result.insert(key)
+                queue.append((key, resourceText))
+            }
+
+            // Follow Form XObjects that are actually invoked by a reachable
+            // content stream. Image XObjects and unused Form streams remain
+            // excluded. Nested forms are followed recursively with a cycle
+            // guard and a conservative depth cap.
+            var visitedForms: Set<String> = []
+            var index = 0
+            while index < queue.count, index < 256 {
+                let item = queue[index]
+                index += 1
+                guard let stream = streamByKey[item.key] else { continue }
+
+                let availableXObjects =
+                    xObjectMap(in: resolvedResourceText(stream.dictionary))
+                        .merging(xObjectMap(in: item.resources)) {
+                            own, _ in own
+                        }
+
+                for name in try referencedDoNames(in: stream) {
+                    let candidateKey =
+                        availableXObjects[name] ?? pageXObjects[name]
+                    guard let candidateKey,
+                          !visitedForms.contains(candidateKey),
+                          let candidate = streamByKey[candidateKey],
+                          candidate.dictionary.range(
+                              of: #"/Subtype\s*/Form\b"#,
+                              options: .regularExpression
+                          ) != nil else {
+                        continue
+                    }
+
+                    visitedForms.insert(candidateKey)
+                    result.insert(candidateKey)
+
+                    let formResources =
+                        resolvedResourceText(candidate.dictionary)
+                    queue.append(
+                        (
+                            candidateKey,
+                            formResources == candidate.dictionary
+                                ? item.resources
+                                : formResources
+                        )
+                    )
+                }
             }
         }
 
