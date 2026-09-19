@@ -474,7 +474,12 @@ final class PDFEditorTests: XCTestCase {
             return XCTFail("Rewritten bfrange-array PDF should reopen")
         }
         let extracted = reopened.page(at: 0)?.string ?? ""
-        XCTAssertTrue(extracted.contains("您好1200"))
+        let rewrittenObjects = try MinimalPDFTextRewriter.textObjects(in: url)
+            .map(\.text)
+        XCTAssertTrue(
+            extracted.contains("您好1200"),
+            "PDFKit extracted: \(extracted); writer objects: \(rewrittenObjects)"
+        )
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
