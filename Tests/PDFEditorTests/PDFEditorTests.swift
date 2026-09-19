@@ -446,6 +446,37 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
+    func testMixedSimpleAndType0FontsUseActiveTfCMap() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mixed-font-cmap-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeMixedSimpleAndType0PDF(to: url)
+
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Mixed-font fixture should open")
+        }
+        let original = pdf.page(at: 0)?.string ?? ""
+        XCTAssertTrue(original.contains("Hello"))
+        XCTAssertTrue(original.contains("你好100"))
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "你好100",
+            newText: "您好1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Mixed-font rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello"))
+        XCTAssertTrue(extracted.contains("您好1200"))
+        XCTAssertFalse(extracted.contains("你好100"))
+    }
+
     func testIndirectLengthCompressedWriteback() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("indirect-length-\(UUID().uuidString).pdf")
@@ -507,6 +538,110 @@ final class PDFEditorTests: XCTestCase {
             return XCTFail("Failed writeback must leave a valid PDF")
         }
         XCTAssertTrue(reopened.page(at: 0)?.string?.contains("100 and 100") == true)
+    }
+
+    private func writeMixedSimpleAndType0PDF(to url: URL) throws {
+        let content = """
+        BT
+        /F1 12 Tf
+        72 740 Td
+        <48656C6C6F> Tj
+        ET
+        BT
+        /F2 16 Tf
+        72 720 Td
+        <00010002001100100010> Tj
+        ET
+        """
+        guard let contentPlain = content.data(using: .ascii) else {
+            throw NSError(domain: "PDFEditorTests", code: 20)
+        }
+        let contentData = try zlibEncodeForFixture(contentPlain)
+
+        let cmap = """
+        /CIDInit /ProcSet findresource begin
+        12 dict begin
+        begincmap
+        /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+        /CMapName /Adobe-Identity-UCS def
+        /CMapType 2 def
+        1 begincodespacerange
+        <0000> <FFFF>
+        endcodespacerange
+        3 beginbfchar
+        <0001> <4F60>
+        <0002> <597D>
+        <0003> <60A8>
+        endbfchar
+        1 beginbfrange
+        <0010> <0012> <0030>
+        endbfrange
+        endcmap
+        CMapName currentdict /CMap defineresource pop
+        end
+        end
+        """
+        guard let cmapPlain = cmap.data(using: .ascii) else {
+            throw NSError(domain: "PDFEditorTests", code: 21)
+        }
+        let cmapData = try zlibEncodeForFixture(cmapPlain)
+
+        var pdf = Data("%PDF-1.4\n".utf8)
+        var offsets = [Int](repeating: -1, count: 10)
+
+        func appendObject(_ number: Int, header: String, stream: Data? = nil) {
+            offsets[number] = pdf.count
+            pdf.append(contentsOf: "\(number) 0 obj\n".utf8)
+            pdf.append(contentsOf: header.utf8)
+            if let stream {
+                pdf.append(contentsOf: "\nstream\n".utf8)
+                pdf.append(stream)
+                pdf.append(contentsOf: "\nendstream".utf8)
+            }
+            pdf.append(contentsOf: "\nendobj\n".utf8)
+        }
+
+        appendObject(1, header: "<< /Type /Catalog /Pages 2 0 R >>")
+        appendObject(2, header: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        appendObject(
+            3,
+            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 9 0 R >>"
+        )
+        appendObject(4, header: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        appendObject(
+            5,
+            header: "<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>"
+        )
+        appendObject(
+            6,
+            header: "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 /CIDToGIDMap /Identity >>"
+        )
+        appendObject(
+            7,
+            header: "<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >>"
+        )
+        appendObject(
+            8,
+            header: "<< /Length \(cmapData.count) /Filter /FlateDecode >>",
+            stream: cmapData
+        )
+        appendObject(
+            9,
+            header: "<< /Length \(contentData.count) /Filter /FlateDecode >>",
+            stream: contentData
+        )
+
+        let objectCount = 9
+        let xrefOffset = pdf.count
+        pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
+        pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
+        for number in 1...objectCount {
+            pdf.append(contentsOf: String(format: "%010d 00000 n \n", offsets[number]).utf8)
+        }
+        pdf.append(contentsOf: "trailer\n<< /Size \(objectCount + 1) /Root 1 0 R >>\n".utf8)
+        pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
+
+        try pdf.write(to: url, options: .atomic)
     }
 
     private func writeType0ToUnicodePDF(
