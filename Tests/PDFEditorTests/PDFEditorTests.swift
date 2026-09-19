@@ -331,6 +331,40 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
+    func testIndirectLengthCompressedWriteback() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("indirect-length-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n(Hello 100) Tj\nET\n"
+        try writeCustomContentPDF(
+            to: url,
+            streamText: streamText,
+            compressed: true,
+            indirectLength: true
+        )
+
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Indirect-Length fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Rewritten indirect-Length PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
     func testAmbiguousWritebackFailsWithoutCorruptingPDF() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("PDFEditor-ambiguous-\(UUID().uuidString).pdf")
@@ -382,7 +416,8 @@ final class PDFEditorTests: XCTestCase {
     private func writeCustomContentPDF(
         to url: URL,
         streamText: String,
-        compressed: Bool
+        compressed: Bool,
+        indirectLength: Bool = false
     ) throws {
         guard let plainStream = streamText.data(using: .ascii) else {
             throw NSError(domain: "PDFEditorTests", code: 3)
@@ -413,19 +448,29 @@ final class PDFEditorTests: XCTestCase {
         appendObject(4, header: "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 
         let filter = compressed ? " /Filter /FlateDecode" : ""
-        appendObject(
-            5,
-            header: "<< /Length \(streamData.count)\(filter) >>",
-            stream: streamData
-        )
+        if indirectLength {
+            appendObject(
+                5,
+                header: "<< /Length 6 0 R\(filter) >>",
+                stream: streamData
+            )
+            appendObject(6, header: "\(streamData.count)")
+        } else {
+            appendObject(
+                5,
+                header: "<< /Length \(streamData.count)\(filter) >>",
+                stream: streamData
+            )
+        }
 
+        let objectCount = offsets.count - 1
         let xrefOffset = pdf.count
-        pdf.append(contentsOf: "xref\n0 6\n".utf8)
+        pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
         pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
         for offset in offsets.dropFirst() {
             pdf.append(contentsOf: String(format: "%010d 00000 n \n", offset).utf8)
         }
-        pdf.append(contentsOf: "trailer\n<< /Size 6 /Root 1 0 R >>\n".utf8)
+        pdf.append(contentsOf: "trailer\n<< /Size \(objectCount + 1) /Root 1 0 R >>\n".utf8)
         pdf.append(contentsOf: "startxref\n\(xrefOffset)\n%%EOF\n".utf8)
 
         try pdf.write(to: url, options: .atomic)
