@@ -446,6 +446,38 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
+    func testType0ToUnicodeBFRangeArrayWriteback() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("type0-bfrange-array-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeType0ToUnicodePDF(
+            to: url,
+            compressed: true,
+            useBFRangeArray: true
+        )
+
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("bfrange-array fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("你好100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "你好100",
+            newText: "您好1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Rewritten bfrange-array PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("您好1200"))
+        XCTAssertFalse(extracted.contains("你好100"))
+    }
+
     func testMixedSimpleAndType0FontsUseActiveTfCMap() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("mixed-font-cmap-\(UUID().uuidString).pdf")
@@ -616,6 +648,18 @@ final class PDFEditorTests: XCTestCase {
         }
         let contentData = try zlibEncodeForFixture(contentPlain)
 
+        let numericRange = useBFRangeArray
+            ? """
+              1 beginbfrange
+              <0010> <0012> [<0030> <0031> <0032>]
+              endbfrange
+              """
+            : """
+              1 beginbfrange
+              <0010> <0012> <0030>
+              endbfrange
+              """
+
         let cmap = """
         /CIDInit /ProcSet findresource begin
         12 dict begin
@@ -631,9 +675,7 @@ final class PDFEditorTests: XCTestCase {
         <0002> <597D>
         <0003> <60A8>
         endbfchar
-        1 beginbfrange
-        <0010> <0012> <0030>
-        endbfrange
+        \(numericRange)
         endcmap
         CMapName currentdict /CMap defineresource pop
         end
@@ -705,7 +747,8 @@ final class PDFEditorTests: XCTestCase {
     private func writeType0ToUnicodePDF(
         to url: URL,
         compressed: Bool,
-        useTJArray: Bool = false
+        useTJArray: Bool = false,
+        useBFRangeArray: Bool = false
     ) throws {
         let textOperator = useTJArray
             ? "[<0001> -25 <0002> 10 <001100100010>] TJ"
