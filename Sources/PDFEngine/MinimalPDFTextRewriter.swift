@@ -15,7 +15,7 @@ import Foundation
 /// - variable-length printable-ASCII replacements
 /// - direct and indirect stream `/Length` entries
 ///
-/// Deliberately not supported yet: hex strings inside `TJ` arrays, encrypted PDFs,
+/// Deliberately not supported yet: encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
 enum MinimalPDFTextRewriter {
     enum RewriteError: Error, Equatable {
@@ -451,12 +451,15 @@ enum MinimalPDFTextRewriter {
 
     private enum TJToken {
         case literal(String)
+        case hex(Data)
         case raw(String)
 
         var visibleText: String {
             switch self {
             case .literal(let encoded):
                 return decodeLiteralBody(encoded)
+            case .hex(let data):
+                return String(data: data, encoding: .isoLatin1) ?? ""
             case .raw:
                 return ""
             }
@@ -466,6 +469,8 @@ enum MinimalPDFTextRewriter {
             switch self {
             case .literal(let encoded):
                 return "(\(encoded))"
+            case .hex(let data):
+                return "<\(encodeHexString(data))>"
             case .raw(let raw):
                 return raw
             }
@@ -503,8 +508,16 @@ enum MinimalPDFTextRewriter {
         var lastAffectedIndex: Int?
 
         for index in tokens.indices {
-            guard case .literal(let encoded) = tokens[index] else { continue }
-            let decoded = decodeLiteralBody(encoded)
+            let decoded: String
+            switch tokens[index] {
+            case .literal(let encoded):
+                decoded = decodeLiteralBody(encoded)
+            case .hex(let data):
+                decoded = String(data: data, encoding: .isoLatin1) ?? ""
+            case .raw:
+                continue
+            }
+
             let start = runningOffset
             let end = runningOffset + decoded.count
 
@@ -527,9 +540,20 @@ enum MinimalPDFTextRewriter {
         // retained in the last affected literal.
         runningOffset = 0
         for index in tokens.indices {
-            guard case .literal(let encoded) = tokens[index] else { continue }
+            let decoded: String
+            let originalWasHex: Bool
 
-            let decoded = decodeLiteralBody(encoded)
+            switch tokens[index] {
+            case .literal(let encoded):
+                decoded = decodeLiteralBody(encoded)
+                originalWasHex = false
+            case .hex(let data):
+                decoded = String(data: data, encoding: .isoLatin1) ?? ""
+                originalWasHex = true
+            case .raw:
+                continue
+            }
+
             let tokenStart = runningOffset
             let tokenEnd = runningOffset + decoded.count
             runningOffset = tokenEnd
@@ -545,8 +569,16 @@ enum MinimalPDFTextRewriter {
             let prefix = index == firstIndex ? String(decoded[..<prefixEnd]) : ""
             let suffix = index == lastIndex ? String(decoded[suffixIndex...]) : ""
             let replacementChunk = index == firstIndex ? newText : ""
+            let newVisible = prefix + replacementChunk + suffix
 
-            tokens[index] = .literal(encodeLiteralBody(prefix + replacementChunk + suffix))
+            if originalWasHex {
+                guard let bytes = newVisible.data(using: .isoLatin1) else {
+                    throw RewriteError.unsupportedEncoding
+                }
+                tokens[index] = .hex(bytes)
+            } else {
+                tokens[index] = .literal(encodeLiteralBody(newVisible))
+            }
         }
 
         let rebuilt = tokens.map(\.encoded).joined(separator: " ")
@@ -592,10 +624,24 @@ enum MinimalPDFTextRewriter {
                 }
             }
 
+            if body[index] == "<" {
+                let contentStart = body.index(after: index)
+                if let close = body[contentStart...].firstIndex(of: ">") {
+                    let rawHex = String(body[contentStart..<close])
+                        .filter { !$0.isWhitespace }
+                    if let data = decodeHexString(rawHex) {
+                        tokens.append(.hex(data))
+                        index = body.index(after: close)
+                        continue
+                    }
+                }
+            }
+
             let start = index
             while index < body.endIndex,
                   !body[index].isWhitespace,
-                  body[index] != "(" {
+                  body[index] != "(",
+                  body[index] != "<" {
                 index = body.index(after: index)
             }
             tokens.append(.raw(String(body[start..<index])))
