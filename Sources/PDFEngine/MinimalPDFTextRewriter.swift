@@ -172,20 +172,21 @@ enum MinimalPDFTextRewriter {
                 streamDataStart += 1
             }
 
-            guard let endStreamPos = find(endStreamMarker, in: bytes, from: streamDataStart),
-                  endStreamPos <= endObjPos else {
+            guard let declaredLength = directStreamLength(in: dictionary),
+                  declaredLength >= 0,
+                  streamDataStart + declaredLength <= bytes.count else {
+                // Indirect /Length objects are intentionally deferred until a
+                // proper object resolver is introduced.
                 searchIndex = afterHeader
                 continue
             }
 
-            var streamDataEnd = endStreamPos
-            if streamDataEnd > streamDataStart, bytes[streamDataEnd - 1] == 0x0A {
-                streamDataEnd -= 1
-                if streamDataEnd > streamDataStart, bytes[streamDataEnd - 1] == 0x0D {
-                    streamDataEnd -= 1
-                }
-            } else if streamDataEnd > streamDataStart, bytes[streamDataEnd - 1] == 0x0D {
-                streamDataEnd -= 1
+            let streamDataEnd = streamDataStart + declaredLength
+            guard streamDataEnd <= endObjPos,
+                  let endStreamPos = find(endStreamMarker, in: bytes, from: streamDataEnd),
+                  endStreamPos <= endObjPos else {
+                searchIndex = afterHeader
+                continue
             }
 
             results.append(
@@ -202,6 +203,17 @@ enum MinimalPDFTextRewriter {
         }
 
         return results
+    }
+
+    private static func directStreamLength(in dictionary: String) -> Int? {
+        let pattern = #"/Length\s+(\d+)(?!\s+\d+\s+R)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
+        guard let match = regex.firstMatch(in: dictionary, range: range),
+              let valueRange = Range(match.range(at: 1), in: dictionary) else {
+            return nil
+        }
+        return Int(dictionary[valueRange])
     }
 
     private static func parseObjectHeader(_ text: String) -> (Int, Int)? {
