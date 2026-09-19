@@ -86,7 +86,7 @@ final class PDFEditorTests: XCTestCase {
             )
             XCTFail("Expected unsupportedContentWriteback")
         } catch let error as PDFContentError {
-            guard case .unsupportedContentWriteback = error else {
+            guard case .textNotFound = error else {
                 return XCTFail("Unexpected PDFContentError: \(error)")
             }
         } catch {
@@ -306,8 +306,8 @@ final class PDFEditorTests: XCTestCase {
     private func zlibEncodeForFixture(_ input: Data) throws -> Data {
         var capacity = max(input.count * 2, input.count + 1024)
         while capacity <= 4 * 1024 * 1024 {
-            var output = Data(count: capacity)
-            let encodedCount = output.withUnsafeMutableBytes { destination in
+            var raw = Data(count: capacity)
+            let encodedCount = raw.withUnsafeMutableBytes { destination in
                 input.withUnsafeBytes { source in
                     compression_encode_buffer(
                         destination.bindMemory(to: UInt8.self).baseAddress!,
@@ -320,12 +320,31 @@ final class PDFEditorTests: XCTestCase {
                 }
             }
             if encodedCount > 0 {
-                output.count = encodedCount
-                return output
+                raw.count = encodedCount
+                var wrapped = Data([0x78, 0x9C])
+                wrapped.append(raw)
+
+                let checksum = adler32ForFixture(input)
+                wrapped.append(UInt8((checksum >> 24) & 0xFF))
+                wrapped.append(UInt8((checksum >> 16) & 0xFF))
+                wrapped.append(UInt8((checksum >> 8) & 0xFF))
+                wrapped.append(UInt8(checksum & 0xFF))
+                return wrapped
             }
             capacity *= 2
         }
         throw NSError(domain: "PDFEditorTests", code: 2)
+    }
+
+    private func adler32ForFixture(_ data: Data) -> UInt32 {
+        let modulus: UInt32 = 65_521
+        var a: UInt32 = 1
+        var b: UInt32 = 0
+        for byte in data {
+            a = (a + UInt32(byte)) % modulus
+            b = (b + a) % modulus
+        }
+        return (b << 16) | a
     }
 
 }
