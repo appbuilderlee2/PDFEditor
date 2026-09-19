@@ -28,7 +28,7 @@ public final class PDFContentStreamParser {
 
     private func extractContentStream(page: PDFPage) -> Data? {
         guard let pageReference = page.pageRef else { return nil }
-        let dictionary = CGPDFPageGetDictionary(pageReference)
+        guard let dictionary = pageReference.dictionary else { return nil }
         var contentsObject: CGPDFObjectRef?
         guard CGPDFDictionaryGetObject(dictionary, "Contents", &contentsObject),
               let contentsObject else {

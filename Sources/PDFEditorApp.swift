@@ -72,7 +72,7 @@ final class DocumentController: ObservableObject {
     func saveAs(_ document: PDFDocumentWrapper) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
-        panel.canCreateDirectory = true
+        panel.canCreateDirectories = true
         panel.nameFieldStringValue = document.url?.lastPathComponent ?? "Untitled.pdf"
 
         guard panel.runModal() == .OK, let url = panel.url else { return }

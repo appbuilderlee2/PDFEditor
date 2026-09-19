@@ -96,7 +96,7 @@ struct MainView: View {
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
         pdfView.displaysPageBreaks = true
-        pdfView.allowsDragging = false
+        pdfView.unregisterDraggedTypes()
     }
 
     private func synchronizeDocument() {
