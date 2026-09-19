@@ -331,6 +331,60 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("Hello 100"))
     }
 
+    func testMixedLiteralAndHexTJArrayWriteback() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tj-mixed-hex-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeMixedHexTJArrayPDF(to: url, compressed: false)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Mixed TJ fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "Hello 100",
+            newText: "Hi 1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Mixed TJ rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hi 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
+    func testCompressedMixedLiteralAndHexTJArrayWriteback() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tj-mixed-hex-compressed-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeMixedHexTJArrayPDF(to: url, compressed: true)
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Compressed mixed TJ fixture should open")
+        }
+        XCTAssertTrue(pdf.page(at: 0)?.string?.contains("Hello 100") == true)
+
+        let wrapper = PDFDocumentWrapper(url: url, pdfDocument: pdf)
+        try PDFContentEngine.shared.replaceText(
+            document: wrapper,
+            pageIndex: 0,
+            oldText: "100",
+            newText: "1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Compressed mixed TJ rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("Hello 1200"))
+        XCTAssertFalse(extracted.contains("Hello 100"))
+    }
+
     func testIndirectLengthCompressedWriteback() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("indirect-length-\(UUID().uuidString).pdf")
@@ -392,6 +446,17 @@ final class PDFEditorTests: XCTestCase {
             return XCTFail("Failed writeback must leave a valid PDF")
         }
         XCTAssertTrue(reopened.page(at: 0)?.string?.contains("100 and 100") == true)
+    }
+
+    private func writeMixedHexTJArrayPDF(
+        to url: URL,
+        compressed: Bool
+    ) throws {
+        let hex = Data("100".utf8)
+            .map { String(format: "%02X", $0) }
+            .joined()
+        let streamText = "BT\n/F1 12 Tf\n72 720 Td\n[(Hello ) -20 <\(hex)>] TJ\nET\n"
+        try writeCustomContentPDF(to: url, streamText: streamText, compressed: compressed)
     }
 
     private func writeHexTjPDF(
