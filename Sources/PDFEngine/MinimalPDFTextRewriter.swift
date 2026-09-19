@@ -624,6 +624,238 @@ enum MinimalPDFTextRewriter {
         return resolved
     }
 
+    /// Resolve a page's font resources to the page's own content stream.
+    /// This allows /F1 on page A and /F1 on page B to refer to different
+    /// Type0 fonts without becoming globally ambiguous.
+    private static func type0ToUnicodeCMapsByContentStream(
+        in pdfData: Data,
+        streams: [StreamObject]
+    ) throws -> [String: [String: ToUnicodeCMap]] {
+        guard let source = String(data: pdfData, encoding: .isoLatin1) else {
+            return [:]
+        }
+
+        let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
+
+        // Build Type0 font object -> ToUnicode CMap.
+        let type0Regex = try NSRegularExpression(
+            pattern: #"(?s)(\d+)\s+(\d+)\s+obj\s*<<(?:(?!endobj).)*?/Subtype\s*/Type0(?:(?!endobj).)*?/ToUnicode\s+(\d+)\s+(\d+)\s+R(?:(?!endobj).)*?endobj"#
+        )
+        var cmapByFontObject: [Int: ToUnicodeCMap] = [:]
+
+        for match in type0Regex.matches(in: source, range: fullRange) {
+            guard let fontRange = Range(match.range(at: 1), in: source),
+                  let cmapRange = Range(match.range(at: 3), in: source),
+                  let cmapGenRange = Range(match.range(at: 4), in: source),
+                  let fontObject = Int(source[fontRange]),
+                  let cmapObject = Int(source[cmapRange]),
+                  let cmapGeneration = Int(source[cmapGenRange]),
+                  let stream = streams.last(where: {
+                      $0.objectNumber == cmapObject &&
+                      $0.generation == cmapGeneration
+                  }) else {
+                continue
+            }
+
+            let decoded = stream.isFlateEncoded
+                ? try zlibDecode(stream.encodedData)
+                : stream.encodedData
+
+            guard let cmapText = String(data: decoded, encoding: .ascii),
+                  let cmap = parseToUnicodeCMap(cmapText) else {
+                continue
+            }
+            cmapByFontObject[fontObject] = cmap
+        }
+
+        guard !cmapByFontObject.isEmpty else { return [:] }
+
+        let pageRegex = try NSRegularExpression(
+            pattern: #"(?s)(\d+)\s+(\d+)\s+obj\s*(<<(?:(?!endobj).)*?/Type\s*/Page\b(?:(?!endobj).)*?>>)\s*endobj"#
+        )
+        let fontDictionaryRegex = try NSRegularExpression(
+            pattern: #"(?s)/Font\s*<<(.+?)>>"#
+        )
+        let fontEntryRegex = try NSRegularExpression(
+            pattern: #"/([^\s/<>\[\]()]+)\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let indirectResourcesRegex = try NSRegularExpression(
+            pattern: #"/Resources\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let contentsArrayRegex = try NSRegularExpression(
+            pattern: #"(?s)/Contents\s*\[(.*?)\]"#
+        )
+        let contentsDirectRegex = try NSRegularExpression(
+            pattern: #"/Contents\s+(\d+)\s+(\d+)\s+R"#
+        )
+        let referenceRegex = try NSRegularExpression(
+            pattern: #"(\d+)\s+(\d+)\s+R"#
+        )
+
+        func indirectObjectBody(_ objectNumber: Int, _ generation: Int) -> String? {
+            let escaped = #"(?s)(?:^|[\r\n])"# +
+                String(objectNumber) + #"\s+"# +
+                String(generation) + #"\s+obj\s*(.*?)\s*endobj"#
+            guard let regex = try? NSRegularExpression(pattern: escaped),
+                  let match = regex.matches(in: source, range: fullRange).last,
+                  let bodyRange = Range(match.range(at: 1), in: source) else {
+                return nil
+            }
+            return String(source[bodyRange])
+        }
+
+        func fontObjects(in resourceText: String) -> [String: Int] {
+            let resourceRange = NSRange(
+                resourceText.startIndex..<resourceText.endIndex,
+                in: resourceText
+            )
+            guard let fontMatch = fontDictionaryRegex.firstMatch(
+                in: resourceText,
+                range: resourceRange
+            ),
+            let dictRange = Range(fontMatch.range(at: 1), in: resourceText) else {
+                return [:]
+            }
+
+            let dictionary = String(resourceText[dictRange])
+            let dictionaryRange = NSRange(
+                dictionary.startIndex..<dictionary.endIndex,
+                in: dictionary
+            )
+            var result: [String: Int] = [:]
+
+            for entry in fontEntryRegex.matches(
+                in: dictionary,
+                range: dictionaryRange
+            ) {
+                guard let nameRange = Range(entry.range(at: 1), in: dictionary),
+                      let objectRange = Range(entry.range(at: 2), in: dictionary),
+                      let objectNumber = Int(dictionary[objectRange]),
+                      cmapByFontObject[objectNumber] != nil else {
+                    continue
+                }
+                result[String(dictionary[nameRange])] = objectNumber
+            }
+            return result
+        }
+
+        func contentStreamKeys(in pageBody: String) -> [String] {
+            let pageRange = NSRange(
+                pageBody.startIndex..<pageBody.endIndex,
+                in: pageBody
+            )
+            var keys: [String] = []
+
+            if let arrayMatch = contentsArrayRegex.firstMatch(
+                in: pageBody,
+                range: pageRange
+            ),
+            let arrayRange = Range(arrayMatch.range(at: 1), in: pageBody) {
+                let arrayBody = String(pageBody[arrayRange])
+                let arrayNSRange = NSRange(
+                    arrayBody.startIndex..<arrayBody.endIndex,
+                    in: arrayBody
+                )
+                for reference in referenceRegex.matches(
+                    in: arrayBody,
+                    range: arrayNSRange
+                ) {
+                    guard let objectRange = Range(
+                        reference.range(at: 1),
+                        in: arrayBody
+                    ),
+                    let generationRange = Range(
+                        reference.range(at: 2),
+                        in: arrayBody
+                    ),
+                    let objectNumber = Int(arrayBody[objectRange]),
+                    let generation = Int(arrayBody[generationRange]) else {
+                        continue
+                    }
+                    keys.append(
+                        streamKey(
+                            objectNumber: objectNumber,
+                            generation: generation
+                        )
+                    )
+                }
+                return keys
+            }
+
+            if let directMatch = contentsDirectRegex.firstMatch(
+                in: pageBody,
+                range: pageRange
+            ),
+            let objectRange = Range(directMatch.range(at: 1), in: pageBody),
+            let generationRange = Range(directMatch.range(at: 2), in: pageBody),
+            let objectNumber = Int(pageBody[objectRange]),
+            let generation = Int(pageBody[generationRange]) {
+                keys.append(
+                    streamKey(
+                        objectNumber: objectNumber,
+                        generation: generation
+                    )
+                )
+            }
+            return keys
+        }
+
+        var result: [String: [String: ToUnicodeCMap]] = [:]
+        var assignedFontObjects: [String: [String: Int]] = [:]
+
+        for pageMatch in pageRegex.matches(in: source, range: fullRange) {
+            guard let pageRange = Range(pageMatch.range(at: 3), in: source) else {
+                continue
+            }
+            let pageBody = String(source[pageRange])
+            let pageNSRange = NSRange(
+                pageBody.startIndex..<pageBody.endIndex,
+                in: pageBody
+            )
+
+            var resourceText = pageBody
+            if let resourceMatch = indirectResourcesRegex.firstMatch(
+                in: pageBody,
+                range: pageNSRange
+            ),
+            let objectRange = Range(resourceMatch.range(at: 1), in: pageBody),
+            let generationRange = Range(resourceMatch.range(at: 2), in: pageBody),
+            let objectNumber = Int(pageBody[objectRange]),
+            let generation = Int(pageBody[generationRange]),
+            let indirect = indirectObjectBody(objectNumber, generation) {
+                resourceText = indirect
+            }
+
+            let pageFonts = fontObjects(in: resourceText)
+            guard !pageFonts.isEmpty else { continue }
+
+            for contentKey in contentStreamKeys(in: pageBody) {
+                var fontAssignments = assignedFontObjects[contentKey] ?? [:]
+                var maps = result[contentKey] ?? [:]
+
+                for (resourceName, fontObject) in pageFonts {
+                    if let previous = fontAssignments[resourceName],
+                       previous != fontObject {
+                        // Reused stream under conflicting resources: do not
+                        // guess which font map applies to that resource name.
+                        fontAssignments.removeValue(forKey: resourceName)
+                        maps.removeValue(forKey: resourceName)
+                        continue
+                    }
+
+                    guard let cmap = cmapByFontObject[fontObject] else { continue }
+                    fontAssignments[resourceName] = fontObject
+                    maps[resourceName] = cmap
+                }
+
+                assignedFontObjects[contentKey] = fontAssignments
+                result[contentKey] = maps
+            }
+        }
+
+        return result
+    }
+
     private static func parseToUnicodeCMap(_ cmap: String) -> ToUnicodeCMap? {
         var forward: [Data: String] = [:]
 
