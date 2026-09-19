@@ -478,6 +478,43 @@ final class PDFEditorTests: XCTestCase {
         XCTAssertFalse(extracted.contains("你好100"))
     }
 
+    func testIndirectResourcesAndFontDictionaryResolveCMap() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("indirect-resources-font-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try writeType0ToUnicodePDF(
+            to: url,
+            compressed: true,
+            indirectResourcesAndFont: true
+        )
+
+        guard let pdf = PDFDocument(url: url) else {
+            return XCTFail("Indirect resource fixture should open")
+        }
+        XCTAssertTrue((pdf.page(at: 0)?.string ?? "").contains("你好100"))
+
+        let objects = try MinimalPDFTextRewriter.textObjects(in: url)
+        guard let target = objects.first(where: { $0.text == "你好100" }) else {
+            return XCTFail("Indirect /Resources -> /Font map should resolve")
+        }
+        XCTAssertEqual(target.fontResourceName, "F1")
+
+        try MinimalPDFTextRewriter.replaceText(
+            in: url,
+            target: target.id,
+            oldText: "你好100",
+            newText: "您好1200"
+        )
+
+        guard let reopened = PDFDocument(url: url) else {
+            return XCTFail("Indirect-resource rewritten PDF should reopen")
+        }
+        let extracted = reopened.page(at: 0)?.string ?? ""
+        XCTAssertTrue(extracted.contains("您好1200"))
+        XCTAssertFalse(extracted.contains("你好100"))
+    }
+
     func testMixedSimpleAndType0FontsUseActiveTfCMap() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("mixed-font-cmap-\(UUID().uuidString).pdf")
@@ -934,7 +971,8 @@ final class PDFEditorTests: XCTestCase {
         to url: URL,
         compressed: Bool,
         useTJArray: Bool = false,
-        useBFRangeArray: Bool = false
+        useBFRangeArray: Bool = false,
+        indirectResourcesAndFont: Bool = false
     ) throws {
         let textOperator = useTJArray
             ? "[<0001> -25 <0002> 10 <001100100010>] TJ"
@@ -1000,11 +1038,15 @@ final class PDFEditorTests: XCTestCase {
             pdf.append(contentsOf: "\nendobj\n".utf8)
         }
 
+        let resources = indirectResourcesAndFont
+            ? "/Resources 9 0 R"
+            : "/Resources << /Font << /F1 4 0 R >> >>"
+
         appendObject(1, header: "<< /Type /Catalog /Pages 2 0 R >>")
         appendObject(2, header: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
         appendObject(
             3,
-            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 8 0 R >>"
+            header: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \(resources) /Contents 8 0 R >>"
         )
         appendObject(
             4,
@@ -1029,7 +1071,12 @@ final class PDFEditorTests: XCTestCase {
             stream: contentData
         )
 
-        let objectCount = 8
+        if indirectResourcesAndFont {
+            appendObject(9, header: "<< /Font 10 0 R >>")
+            appendObject(10, header: "<< /F1 4 0 R >>")
+        }
+
+        let objectCount = indirectResourcesAndFont ? 10 : 8
         let xrefOffset = pdf.count
         pdf.append(contentsOf: "xref\n0 \(objectCount + 1)\n".utf8)
         pdf.append(contentsOf: "0000000000 65535 f \n".utf8)
