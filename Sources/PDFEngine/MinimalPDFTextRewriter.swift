@@ -206,7 +206,16 @@ enum MinimalPDFTextRewriter {
     }
 
     private static func directStreamLength(in dictionary: String) -> Int? {
-        let pattern = #"/Length\s+(\d+)(?!\s+\d+\s+R)"#
+        let indirectPattern = #"/Length\s+\d+\s+\d+\s+R"#
+        if let indirectRegex = try? NSRegularExpression(pattern: indirectPattern),
+           indirectRegex.firstMatch(
+               in: dictionary,
+               range: NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
+           ) != nil {
+            return nil
+        }
+
+        let pattern = #"/Length\s+(\d+)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let range = NSRange(dictionary.startIndex..<dictionary.endIndex, in: dictionary)
         guard let match = regex.firstMatch(in: dictionary, range: range),
