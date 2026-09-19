@@ -27,10 +27,8 @@ let package = Package(
         .testTarget(
             name: "PDFEditorTests",
             dependencies: ["PDFEditorApp"],
-            path: "Tests",
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency"),
-            ]
+            path: "Tests/PDFEditorTests",
+            resources: []
         ),
     ]
 )
