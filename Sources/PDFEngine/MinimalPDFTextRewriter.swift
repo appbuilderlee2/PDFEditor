@@ -549,16 +549,12 @@ enum MinimalPDFTextRewriter {
         }
 
         let decoded: String
-        if let toUnicodeCMap {
-            guard let mapped = toUnicodeCMap.decode(decodedData) else {
-                // This hex operator may belong to a simple byte font even when
-                // another Type0 font exists in the document; fall back below.
-                guard let latin = String(data: decodedData, encoding: .isoLatin1) else {
-                    throw RewriteError.unsupportedEncoding
-                }
-                decoded = latin
-            }
+        if let toUnicodeCMap,
+           let mapped = toUnicodeCMap.decode(decodedData) {
+            decoded = mapped
         } else {
+            // This hex operator may belong to a simple byte font even when
+            // another Type0 font exists in the document.
             guard let latin = String(data: decodedData, encoding: .isoLatin1) else {
                 throw RewriteError.unsupportedEncoding
             }
