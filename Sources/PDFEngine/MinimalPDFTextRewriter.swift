@@ -8,11 +8,12 @@ import Foundation
 ///
 /// Supported now:
 /// - literal-string `Tj`
+/// - literal-string `TJ` arrays, including text split across segments
 /// - uncompressed streams
 /// - `/FlateDecode` streams
 /// - variable-length printable-ASCII replacements
 ///
-/// Deliberately not supported yet: `TJ` arrays, hex strings, encrypted PDFs,
+/// Deliberately not supported yet: hex strings, encrypted PDFs,
 /// object streams, CID/font re-encoding, or multiple ambiguous occurrences.
 enum MinimalPDFTextRewriter {
     enum RewriteError: Error, Equatable {
@@ -76,7 +77,7 @@ enum MinimalPDFTextRewriter {
                 decoded = stream.encodedData
             }
 
-            guard let rewritten = try rewriteUniqueLiteralTj(
+            guard let rewritten = try rewriteUniqueTextOperator(
                 in: decoded,
                 oldText: oldText,
                 newText: newText
@@ -236,12 +237,11 @@ enum MinimalPDFTextRewriter {
         return (objectNumber, generation)
     }
 
-    // MARK: - Literal Tj replacement
+    // MARK: - Tj / TJ replacement
 
-    /// Returns nil if this decoded content stream does not contain the target.
-    /// Throws ambiguousTarget if the target appears more than once in this
-    /// stream, because object identity is not implemented yet.
-    private static func rewriteUniqueLiteralTj(
+    /// Rewrites exactly one matching text-show operator in the decoded stream.
+    /// Both literal-string Tj and literal-string TJ arrays are supported.
+    private static func rewriteUniqueTextOperator(
         in decodedData: Data,
         oldText: String,
         newText: String
@@ -250,64 +250,251 @@ enum MinimalPDFTextRewriter {
             throw RewriteError.unsupportedEncoding
         }
 
-        let pattern = #"\((?:\\.|[^\\)])*\)\s*Tj"#
-        let regex = try NSRegularExpression(pattern: pattern)
+        let operatorPattern = #"(\((?:\\.|[^\\)])*\)\s*Tj)|(\[(?:\\.|[^\]])*\]\s*TJ)"#
+        let regex = try NSRegularExpression(pattern: operatorPattern)
         let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
 
         struct Match {
-            let bodyRange: Range<String.Index>
-            let replacementBody: String
+            let wholeRange: Range<String.Index>
+            let replacement: String
         }
 
         var matches: [Match] = []
 
         for result in regex.matches(in: source, range: fullRange) {
-            guard let wholeRange = Range(result.range, in: source),
-                  let open = source[wholeRange].firstIndex(of: "("),
-                  let close = source[wholeRange].lastIndex(of: ")") else {
-                continue
+            guard let wholeRange = Range(result.range, in: source) else { continue }
+            let whole = String(source[wholeRange])
+
+            let visibleText: String
+            let replacementOperator: String?
+
+            if whole.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("Tj") {
+                guard let parsed = rewriteLiteralTjOperator(
+                    whole,
+                    oldText: oldText,
+                    newText: newText
+                ) else { continue }
+                visibleText = parsed.visibleText
+                replacementOperator = parsed.replacement
+            } else {
+                guard let parsed = try rewriteTJArrayOperator(
+                    whole,
+                    oldText: oldText,
+                    newText: newText
+                ) else { continue }
+                visibleText = parsed.visibleText
+                replacementOperator = parsed.replacement
             }
 
-            let bodyRange = source.index(after: open)..<close
-            let encodedBody = String(source[bodyRange])
-            let decodedBody = decodeLiteralBody(encodedBody)
-
-            var searchStart = decodedBody.startIndex
-            var occurrenceCount = 0
-            var onlyOccurrence: Range<String.Index>?
-
-            while searchStart <= decodedBody.endIndex,
-                  let occurrence = decodedBody.range(of: oldText, range: searchStart..<decodedBody.endIndex) {
-                occurrenceCount += 1
-                onlyOccurrence = occurrence
-                searchStart = occurrence.upperBound
-            }
-
-            guard occurrenceCount > 0 else { continue }
-            guard occurrenceCount == 1, let occurrence = onlyOccurrence else {
-                throw RewriteError.ambiguousTarget
-            }
-
-            var replaced = decodedBody
-            replaced.replaceSubrange(occurrence, with: newText)
-            matches.append(
-                Match(
-                    bodyRange: bodyRange,
-                    replacementBody: encodeLiteralBody(replaced)
-                )
-            )
+            guard visibleText.contains(oldText), let replacementOperator else { continue }
+            matches.append(Match(wholeRange: wholeRange, replacement: replacementOperator))
         }
 
         guard !matches.isEmpty else { return nil }
         guard matches.count == 1 else { throw RewriteError.ambiguousTarget }
 
         let match = matches[0]
-        source.replaceSubrange(match.bodyRange, with: match.replacementBody)
+        source.replaceSubrange(match.wholeRange, with: match.replacement)
 
         guard let rewritten = source.data(using: .isoLatin1) else {
             throw RewriteError.unsupportedEncoding
         }
         return rewritten
+    }
+
+    private static func rewriteLiteralTjOperator(
+        _ whole: String,
+        oldText: String,
+        newText: String
+    ) -> (visibleText: String, replacement: String?)? {
+        guard let open = whole.firstIndex(of: "("),
+              let close = whole.lastIndex(of: ")"),
+              open < close else {
+            return nil
+        }
+
+        let body = String(whole[whole.index(after: open)..<close])
+        let decoded = decodeLiteralBody(body)
+        let occurrences = ranges(of: oldText, in: decoded)
+        guard !occurrences.isEmpty else {
+            return (decoded, nil)
+        }
+        guard occurrences.count == 1, let occurrence = occurrences.first else {
+            return (decoded, nil)
+        }
+
+        var replaced = decoded
+        replaced.replaceSubrange(occurrence, with: newText)
+        return (decoded, "(\(encodeLiteralBody(replaced))) Tj")
+    }
+
+    private enum TJToken {
+        case literal(String)
+        case raw(String)
+
+        var visibleText: String {
+            switch self {
+            case .literal(let encoded):
+                return decodeLiteralBody(encoded)
+            case .raw:
+                return ""
+            }
+        }
+
+        var encoded: String {
+            switch self {
+            case .literal(let encoded):
+                return "(\(encoded))"
+            case .raw(let raw):
+                return raw
+            }
+        }
+    }
+
+    private static func rewriteTJArrayOperator(
+        _ whole: String,
+        oldText: String,
+        newText: String
+    ) throws -> (visibleText: String, replacement: String?)? {
+        guard let open = whole.firstIndex(of: "["),
+              let close = whole.lastIndex(of: "]"),
+              open < close else {
+            return nil
+        }
+
+        let body = String(whole[whole.index(after: open)..<close])
+        var tokens = parseTJTokens(body)
+        let visible = tokens.map(\.visibleText).joined()
+        let occurrences = ranges(of: oldText, in: visible)
+
+        guard !occurrences.isEmpty else {
+            return (visible, nil)
+        }
+        guard occurrences.count == 1, let occurrence = occurrences.first else {
+            throw RewriteError.ambiguousTarget
+        }
+
+        let lowerOffset = visible.distance(from: visible.startIndex, to: occurrence.lowerBound)
+        let upperOffset = visible.distance(from: visible.startIndex, to: occurrence.upperBound)
+
+        var runningOffset = 0
+        var firstAffectedIndex: Int?
+        var lastAffectedIndex: Int?
+
+        for index in tokens.indices {
+            guard case .literal(let encoded) = tokens[index] else { continue }
+            let decoded = decodeLiteralBody(encoded)
+            let start = runningOffset
+            let end = runningOffset + decoded.count
+
+            if max(start, lowerOffset) < min(end, upperOffset) {
+                if firstAffectedIndex == nil { firstAffectedIndex = index }
+                lastAffectedIndex = index
+            }
+
+            runningOffset = end
+        }
+
+        guard let firstIndex = firstAffectedIndex,
+              let lastIndex = lastAffectedIndex else {
+            return (visible, nil)
+        }
+
+        // Preserve all numeric TJ spacing operators. The replacement text is
+        // inserted in the first affected literal; the removed portion is
+        // deleted across subsequent affected literals, while suffix text is
+        // retained in the last affected literal.
+        runningOffset = 0
+        for index in tokens.indices {
+            guard case .literal(let encoded) = tokens[index] else { continue }
+
+            let decoded = decodeLiteralBody(encoded)
+            let tokenStart = runningOffset
+            let tokenEnd = runningOffset + decoded.count
+            runningOffset = tokenEnd
+
+            guard index >= firstIndex, index <= lastIndex else { continue }
+
+            let prefixCount = max(0, min(decoded.count, lowerOffset - tokenStart))
+            let suffixStart = max(0, min(decoded.count, upperOffset - tokenStart))
+
+            let prefixEnd = decoded.index(decoded.startIndex, offsetBy: prefixCount)
+            let suffixIndex = decoded.index(decoded.startIndex, offsetBy: suffixStart)
+
+            let prefix = index == firstIndex ? String(decoded[..<prefixEnd]) : ""
+            let suffix = index == lastIndex ? String(decoded[suffixIndex...]) : ""
+            let replacementChunk = index == firstIndex ? newText : ""
+
+            tokens[index] = .literal(encodeLiteralBody(prefix + replacementChunk + suffix))
+        }
+
+        let rebuilt = tokens.map(\.encoded).joined(separator: " ")
+        return (visible, "[\(rebuilt)] TJ")
+    }
+
+    private static func parseTJTokens(_ body: String) -> [TJToken] {
+        var tokens: [TJToken] = []
+        var index = body.startIndex
+
+        while index < body.endIndex {
+            if body[index].isWhitespace {
+                index = body.index(after: index)
+                continue
+            }
+
+            if body[index] == "(" {
+                let open = index
+                var cursor = body.index(after: index)
+                var depth = 1
+                var escaped = false
+
+                while cursor < body.endIndex, depth > 0 {
+                    let character = body[cursor]
+                    if escaped {
+                        escaped = false
+                    } else if character == "\\" {
+                        escaped = true
+                    } else if character == "(" {
+                        depth += 1
+                    } else if character == ")" {
+                        depth -= 1
+                    }
+                    cursor = body.index(after: cursor)
+                }
+
+                if depth == 0 {
+                    let contentStart = body.index(after: open)
+                    let contentEnd = body.index(before: cursor)
+                    tokens.append(.literal(String(body[contentStart..<contentEnd])))
+                    index = cursor
+                    continue
+                }
+            }
+
+            let start = index
+            while index < body.endIndex,
+                  !body[index].isWhitespace,
+                  body[index] != "(" {
+                index = body.index(after: index)
+            }
+            tokens.append(.raw(String(body[start..<index])))
+        }
+
+        return tokens
+    }
+
+    private static func ranges(of needle: String, in haystack: String) -> [Range<String.Index>] {
+        guard !needle.isEmpty else { return [] }
+        var results: [Range<String.Index>] = []
+        var searchStart = haystack.startIndex
+
+        while searchStart < haystack.endIndex,
+              let range = haystack.range(of: needle, range: searchStart..<haystack.endIndex) {
+            results.append(range)
+            searchStart = range.upperBound
+        }
+
+        return results
     }
 
     // MARK: - Incremental PDF update
