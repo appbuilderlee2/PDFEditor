@@ -26,7 +26,7 @@ enum MinimalPDFTextRewriter {
         let operatorEndOffset: Int
     }
 
-    enum TextOperatorKind: String {
+    enum TextOperatorKind: String, Equatable {
         case literalTj
         case hexTj
         case tjArray
@@ -759,8 +759,7 @@ enum MinimalPDFTextRewriter {
             throw RewriteError.unsupportedEncoding
         }
 
-        let operatorPattern = #"(\((?:\\.|[^\\)])*\)\s*Tj)|(<[0-9A-Fa-f\s]+>\s*Tj)|(\[(?:\\.|[^\]])*\]\s*TJ)"#
-        let regex = try NSRegularExpression(pattern: operatorPattern)
+        let regex = try textOperatorRegex()
         let fullRange = NSRange(source.startIndex..<source.endIndex, in: source)
 
         struct Match {
@@ -827,6 +826,132 @@ enum MinimalPDFTextRewriter {
             throw RewriteError.unsupportedEncoding
         }
         return rewritten
+    }
+
+    private static func textOperatorRegex() throws -> NSRegularExpression {
+        try NSRegularExpression(
+            pattern: #"(\((?:\\.|[^\\)])*\)\s*Tj)|(<[0-9A-Fa-f\s]+>\s*Tj)|(\[(?:\\.|[^\]])*\]\s*TJ)"#
+        )
+    }
+
+    private static func parseVisibleTextOperator(
+        _ whole: String,
+        toUnicodeCMap: ToUnicodeCMap?
+    ) throws -> (text: String, kind: TextOperatorKind)? {
+        let trimmed = whole.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed.hasPrefix("<") && trimmed.hasSuffix("Tj") {
+            guard let open = whole.firstIndex(of: "<"),
+                  let close = whole.firstIndex(of: ">"),
+                  open < close else {
+                return nil
+            }
+
+            let rawHex = String(whole[whole.index(after: open)..<close])
+                .filter { !$0.isWhitespace }
+            guard let data = decodeHexString(rawHex) else {
+                throw RewriteError.unsupportedEncoding
+            }
+
+            if let toUnicodeCMap,
+               let mapped = toUnicodeCMap.decode(data) {
+                return (mapped, .hexTj)
+            }
+
+            guard let latin = String(data: data, encoding: .isoLatin1) else {
+                throw RewriteError.unsupportedEncoding
+            }
+            return (latin, .hexTj)
+        }
+
+        if trimmed.hasSuffix("Tj") {
+            guard let open = whole.firstIndex(of: "("),
+                  let close = whole.lastIndex(of: ")"),
+                  open < close else {
+                return nil
+            }
+            let body = String(whole[whole.index(after: open)..<close])
+            return (decodeLiteralBody(body), .literalTj)
+        }
+
+        if trimmed.hasSuffix("TJ"),
+           let open = whole.firstIndex(of: "["),
+           let close = whole.lastIndex(of: "]"),
+           open < close {
+            let body = String(whole[whole.index(after: open)..<close])
+            let tokens = parseTJTokens(body)
+            let text = try tokens.map {
+                try visibleText(for: $0, toUnicodeCMap: toUnicodeCMap)
+            }.joined()
+            return (text, .tjArray)
+        }
+
+        return nil
+    }
+
+    private static func rewriteSpecificTextOperator(
+        _ whole: String,
+        oldText: String,
+        newText: String,
+        toUnicodeCMap: ToUnicodeCMap?
+    ) throws -> String? {
+        guard let parsed = try parseVisibleTextOperator(
+            whole,
+            toUnicodeCMap: toUnicodeCMap
+        ) else {
+            return nil
+        }
+
+        let occurrences = ranges(of: oldText, in: parsed.text)
+        guard !occurrences.isEmpty else { return nil }
+        guard occurrences.count == 1 else {
+            throw RewriteError.ambiguousTarget
+        }
+
+        switch parsed.kind {
+        case .literalTj:
+            return rewriteLiteralTjOperator(
+                whole,
+                oldText: oldText,
+                newText: newText
+            )?.replacement
+        case .hexTj:
+            return try rewriteHexTjOperator(
+                whole,
+                oldText: oldText,
+                newText: newText,
+                toUnicodeCMap: toUnicodeCMap
+            )?.replacement
+        case .tjArray:
+            return try rewriteTJArrayOperator(
+                whole,
+                oldText: oldText,
+                newText: newText,
+                toUnicodeCMap: toUnicodeCMap
+            )?.replacement
+        }
+    }
+
+    private static func latin1ByteCount<S: StringProtocol>(_ text: S) -> Int {
+        text.unicodeScalars.count
+    }
+
+    private static func latin1StringRange(
+        in source: String,
+        startOffset: Int,
+        endOffset: Int
+    ) -> Range<String.Index>? {
+        guard startOffset >= 0,
+              endOffset >= startOffset else {
+            return nil
+        }
+
+        let scalars = source.unicodeScalars
+        guard endOffset <= scalars.count else { return nil }
+
+        let start = scalars.index(scalars.startIndex, offsetBy: startOffset)
+        let end = scalars.index(scalars.startIndex, offsetBy: endOffset)
+        return start..<end
     }
 
     private static func currentFontResourceName(
