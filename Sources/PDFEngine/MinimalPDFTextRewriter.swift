@@ -480,7 +480,8 @@ enum MinimalPDFTextRewriter {
                 guard let parsed = try rewriteTJArrayOperator(
                     whole,
                     oldText: oldText,
-                    newText: newText
+                    newText: newText,
+                    toUnicodeCMap: toUnicodeCMap
                 ) else { continue }
                 visibleText = parsed.visibleText
                 replacementOperator = parsed.replacement
@@ -641,7 +642,8 @@ enum MinimalPDFTextRewriter {
     private static func rewriteTJArrayOperator(
         _ whole: String,
         oldText: String,
-        newText: String
+        newText: String,
+        toUnicodeCMap: ToUnicodeCMap?
     ) throws -> (visibleText: String, replacement: String?)? {
         guard let open = whole.firstIndex(of: "["),
               let close = whole.lastIndex(of: "]"),
@@ -651,7 +653,9 @@ enum MinimalPDFTextRewriter {
 
         let body = String(whole[whole.index(after: open)..<close])
         var tokens = parseTJTokens(body)
-        let visible = tokens.map(\.visibleText).joined()
+        let visible = try tokens.map {
+            try visibleText(for: $0, toUnicodeCMap: toUnicodeCMap)
+        }.joined()
         let occurrences = ranges(of: oldText, in: visible)
 
         guard !occurrences.isEmpty else {
@@ -671,10 +675,11 @@ enum MinimalPDFTextRewriter {
         for index in tokens.indices {
             let decoded: String
             switch tokens[index] {
-            case .literal(let encoded):
-                decoded = decodeLiteralBody(encoded)
-            case .hex(let data):
-                decoded = String(data: data, encoding: .isoLatin1) ?? ""
+            case .literal, .hex:
+                decoded = try visibleText(
+                    for: tokens[index],
+                    toUnicodeCMap: toUnicodeCMap
+                )
             case .raw:
                 continue
             }
@@ -702,15 +707,21 @@ enum MinimalPDFTextRewriter {
         runningOffset = 0
         for index in tokens.indices {
             let decoded: String
-            let originalWasHex: Bool
+            let originalHexData: Data?
 
             switch tokens[index] {
-            case .literal(let encoded):
-                decoded = decodeLiteralBody(encoded)
-                originalWasHex = false
+            case .literal:
+                decoded = try visibleText(
+                    for: tokens[index],
+                    toUnicodeCMap: toUnicodeCMap
+                )
+                originalHexData = nil
             case .hex(let data):
-                decoded = String(data: data, encoding: .isoLatin1) ?? ""
-                originalWasHex = true
+                decoded = try visibleText(
+                    for: tokens[index],
+                    toUnicodeCMap: toUnicodeCMap
+                )
+                originalHexData = data
             case .raw:
                 continue
             }
@@ -732,9 +743,19 @@ enum MinimalPDFTextRewriter {
             let replacementChunk = index == firstIndex ? newText : ""
             let newVisible = prefix + replacementChunk + suffix
 
-            if originalWasHex {
-                guard let bytes = newVisible.data(using: .isoLatin1) else {
-                    throw RewriteError.unsupportedEncoding
+            if let originalHexData {
+                let bytes: Data
+                if let toUnicodeCMap,
+                   toUnicodeCMap.decode(originalHexData) != nil {
+                    guard let mapped = toUnicodeCMap.encode(newVisible) else {
+                        throw RewriteError.unsupportedEncoding
+                    }
+                    bytes = mapped
+                } else {
+                    guard let latin = newVisible.data(using: .isoLatin1) else {
+                        throw RewriteError.unsupportedEncoding
+                    }
+                    bytes = latin
                 }
                 tokens[index] = .hex(bytes)
             } else {
@@ -744,6 +765,27 @@ enum MinimalPDFTextRewriter {
 
         let rebuilt = tokens.map(\.encoded).joined(separator: " ")
         return (visible, "[\(rebuilt)] TJ")
+    }
+
+    private static func visibleText(
+        for token: TJToken,
+        toUnicodeCMap: ToUnicodeCMap?
+    ) throws -> String {
+        switch token {
+        case .literal(let encoded):
+            return decodeLiteralBody(encoded)
+        case .hex(let data):
+            if let toUnicodeCMap,
+               let mapped = toUnicodeCMap.decode(data) {
+                return mapped
+            }
+            guard let latin = String(data: data, encoding: .isoLatin1) else {
+                throw RewriteError.unsupportedEncoding
+            }
+            return latin
+        case .raw:
+            return ""
+        }
     }
 
     private static func parseTJTokens(_ body: String) -> [TJToken] {
