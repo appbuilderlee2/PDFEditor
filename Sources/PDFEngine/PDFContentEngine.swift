@@ -362,7 +362,7 @@ public final class PDFContentEngine {
                 )
             case .unsupportedEncoding:
                 throw PDFContentError.notYetImplemented(
-                    "目前 writeback milestone 支援 printable ASCII 的 literal Tj/TJ 及 byte-oriented hex Tj"
+                    "目前只能寫入原 PDF encoding / ToUnicode CMap 可表示的文字"
                 )
             case .unsupportedFilter:
                 throw PDFContentError.notYetImplemented(
